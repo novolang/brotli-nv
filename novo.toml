@@ -1,6 +1,6 @@
 [package]
 name        = "brotli-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "RFC 7932 Brotli, decoder first: the stream header and its window bits, meta-blocks, simple and complex prefix codes, context modelling for literals and distances, and the STATIC DICTIONARY with its word transforms as data this package owns.  The load-bearing call is `brotlidist.resolve`: a distance past the current output position is not an error but a dictionary reference, which is what a third of real HTTP responses contain.  Feed-and-drain over a window the caller sizes; the encoder declared for quality 0 to 4.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
