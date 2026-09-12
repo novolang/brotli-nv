@@ -1,0 +1,204 @@
+// brotlidict.nv — 122,784 bytes of English, HTML and HTTP that every
+// Brotli stream can quote, and the 121 ways to bend a word.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SIZE IS THE FIRST FACT, BECAUSE IT IS THE ONE A CONSUMER PAYS
+// FOR.  The static dictionary is 122,784 bytes of data this package
+// owns, holding 13,504 words of lengths 4 to 24, and it is in the
+// binary of every program that links the decoder.  A caller choosing
+// between this and a plain deflate is choosing to carry 120 KB, and a
+// number in a README is not something a build can read — so
+// `dictionary_bytes` and `word_count` are functions, and the test
+// suite asserts them.
+//
+// WHY IT CANNOT BE OPTIONAL.  A Brotli stream does not say whether it
+// used the dictionary; it just emits a distance past the end of its
+// own output, and the decoder is expected to know what that means.  So
+// there is no build without it that decodes correctly — a
+// dictionary-less decoder is not a smaller decoder, it is a decoder
+// that produces wrong bytes on a large share of real HTTP responses.
+// `brotlidist.reaches_dictionary` is where that fact enters the
+// decode, and this module is what it reaches.
+//
+// THE TRANSFORMS ARE THE OTHER HALF, AND THEY ARE NOT A DETAIL.  A
+// dictionary reference is a word AND a transform: 121 of them, each a
+// prefix, a suffix, and an operation on the middle — identity, omit N
+// from the front, omit N from the back, uppercase the first character,
+// uppercase all of it, and the ferment of `" the "`, `"\">"`, `"=\""`
+// and the rest that makes HTML compress.  `" of the "` is not a word in
+// the dictionary; it is `"of"` with transform 7.  A decoder with the
+// words and no transforms is as wrong as one with neither.
+//
+// ONE WORD ON WHAT IS NOT HERE.  Custom dictionaries — RFC 7932's
+// shared-dictionary extension and the `Use-As-Dictionary` header the
+// web is now shipping — are a different value: the caller's own bytes,
+// prepended to the window rather than indexed by length.  That is a
+// row of its own and is named in the README rather than half-built
+// here.
+
+use brotlierror
+
+// One entry of the transform table: what goes before, what happens to
+// the middle, and what goes after.
+//
+// A struct rather than three parallel lists because a transform is
+// applied as one operation and a caller reading the table — a
+// compressor choosing one, a tool explaining a stream — wants the
+// three together.
+pub struct BroTransform
+    // The bytes prefixed to the transformed word.  Often empty; often
+    // a single space.
+    prefix: Bytes
+    // What happens to the word itself.
+    kind: BroTransformKind
+    // How many bytes the operation takes off, for the omit kinds; 0
+    // otherwise.
+    omit: Int
+    // The bytes appended.  `" the "`, `"\">"`, `"=\""` and the rest of
+    // the HTML ferment live here.
+    suffix: Bytes
+
+// What a transform does to the word between its prefix and its suffix.
+//
+// Five kinds rather than 121, with the count and the affixes carrying
+// the variation.  The alternative — 121 variants — would be a table
+// written twice, once as an enum and once as data.
+pub enum BroTransformKind
+    // The word unchanged.
+    BroIdentity
+    // Drop `omit` bytes from the FRONT.
+    BroOmitFirst
+    // Drop `omit` bytes from the BACK.
+    BroOmitLast
+    // Uppercase the first UTF-8 character.
+    //
+    // The first CHARACTER, not the first byte: the dictionary holds
+    // UTF-8 and a byte-wise uppercase corrupts every word that starts
+    // with one that is not ASCII.
+    BroFerment
+    // Uppercase every UTF-8 character in the word.
+    BroFermentAll
+
+// How many bytes the dictionary data is: 122,784.
+//
+// The number a consumer pays, published as a function so a test can
+// hold the implementation to it and a build report can print it.
+pub fn dictionary_bytes() -> Int []
+    todo("brotli-nv.brotlidict.dictionary_bytes")
+
+// How many words the dictionary holds: 13,504.
+pub fn word_count() -> Int []
+    todo("brotli-nv.brotlidict.word_count")
+
+// How many transforms there are: 121.
+pub fn transform_count() -> Int []
+    todo("brotli-nv.brotlidict.transform_count")
+
+// The shortest and longest word length, as a pair: 4 and 24.
+pub fn length_range() -> [Int] []
+    todo("brotli-nv.brotlidict.length_range")
+
+// How many words of a given length the dictionary holds.
+//
+// 0 outside 4 to 24.  The number that makes an index bound checkable
+// before the dictionary is touched, which is what stops a corrupt
+// stream from reading past the data.
+pub fn words_of_length(length: Int) -> Int []
+    todo("brotli-nv.brotlidict.words_of_length")
+
+// Where the words of a given length begin in the dictionary data.
+//
+// Published because the offset table is how a caller that wants to
+// serve the dictionary from a memory-mapped file — or from flash, or
+// from a resource an operating system already has — addresses it
+// without this package's own copy.
+pub fn offset_of_length(length: Int) -> Int []
+    todo("brotli-nv.brotlidict.offset_of_length")
+
+// ── Reading a word ───────────────────────────────────────────────────
+
+// The raw word at an index among the words of that length.
+//
+// `BroBadDictWord` when the length is outside 4 to 24 or the index is
+// past the count — the two bounds a corrupt stream reaches for, named
+// separately from every other fault so a caller can tell a broken
+// response from a broken decoder.
+pub fn word(length: Int, index: Int) -> Result<Bytes, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidict.word")
+
+// Whether a length and index name a word at all.
+//
+// The bound check on its own, for a caller validating a stream without
+// materialising anything.
+pub fn word_exists(length: Int, index: Int) -> Bool []
+    todo("brotli-nv.brotlidict.word_exists")
+
+// ── Transforms ───────────────────────────────────────────────────────
+
+// The transform at an id.
+//
+// `BroBadTransform` past 120.
+pub fn transform(id: Int) -> Result<BroTransform, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidict.transform")
+
+// The identity transform's id: 0.
+//
+// Named because a caller comparing against "no transform" should not
+// be writing a bare 0, and because the encoder's cheapest reference is
+// exactly this one.
+pub fn identity_id() -> Int []
+    todo("brotli-nv.brotlidict.identity_id")
+
+// A word with its transform applied.
+//
+// The call the decoder makes: length, index and transform in, the
+// bytes to append out.  One call rather than word-then-transform
+// because the two bounds checks belong together and because a caller
+// that did it in two steps would have to know that a transform may
+// make the result longer or shorter than the word.
+//
+// ```novo ignore
+// match brotlidict.transformed(2 + 2, 1024, 7)
+//     Ok(b)  => out = bytes.concat([out, b])
+//     Err(e) => return Err(e)
+// ```
+pub fn transformed(length: Int, index: Int,
+                   transform_id: Int) -> Result<Bytes, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidict.transformed")
+
+// How many bytes `transformed` would produce.
+//
+// NOT `length`: a transform adds a prefix, a suffix, or both, and
+// removes bytes from either end.  A caller sizing its output buffer
+// from the copy length alone under-allocates, which is the mistake
+// this function exists to make unnecessary.
+pub fn transformed_len(length: Int, transform_id: Int) -> Int []
+    todo("brotli-nv.brotlidict.transformed_len")
+
+// The longest result any transform can produce from a word of this
+// length.
+//
+// The bound a caller sizing a fixed buffer needs, computed over the
+// whole table rather than per reference.
+pub fn max_transformed_len(length: Int) -> Int []
+    todo("brotli-nv.brotlidict.max_transformed_len")
+
+// Whether a transform changes the word's bytes at all, beyond its
+// affixes.
+//
+// False for `BroIdentity`, true for the other four.  For a tool
+// reporting what a stream is doing, and for an encoder that wants to
+// search only the cheap transforms first.
+pub fn transform_changes_word(id: Int) -> Bool []
+    todo("brotli-nv.brotlidict.transform_changes_word")
+
+// The id the two most common HTML transforms have, as a pair.
+//
+// A leading space with no suffix, and a trailing `"\">"`.  Published
+// because they are what makes the dictionary worth 120 KB on a web
+// page, and because a test asserting the table is loaded correctly
+// wants two entries it can name rather than an index it has to count
+// to.
+pub fn common_html_transforms() -> [Int] []
+    todo("brotli-nv.brotlidict.common_html_transforms")

@@ -1,0 +1,196 @@
+// brotlidec.nv — feed and drain, over a window the caller sized.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHAPE IS flate-nv's, AND DELIBERATELY SO.  A caller pushes
+// compressed chunks in and pulls decompressed bytes out; the decoder
+// holds the window and nothing else; and the loop that drives it is
+// the same loop a caller already wrote for gzip.  `docs/publishing.md`
+// § How a `core` package takes bytes from its host calls this feed and
+// drain, and it is the right shape here because an HTTP response body
+// arrives in pieces and nobody knows how many bytes it will become.
+//
+// THE WINDOW IS THE ONLY THING THE DECODER HOLDS, and its size came
+// from the caller's budget rather than from the stream — see
+// `brotlistream`.  Everything else is per-meta-block state that the
+// value carries and the caller never sees.
+//
+// TWO WAYS TO BE HUNGRY, AND THEY ARE DIFFERENT QUESTIONS.
+// `BroNeedMore` means the decoder has consumed everything it was fed
+// and wants more compressed bytes.  `BroWantsDrain` means the caller's
+// output buffer is full and the decoder is holding finished bytes it
+// cannot hand over.  A single "not done" answer would leave the caller
+// guessing which of the two things to do, and the guess that feeds
+// more into a full decoder is an unbounded buffer.
+//
+// AND THERE IS NO CHECKSUM.  Brotli has none — no CRC, no XXH64,
+// nothing.  A stream that decodes without a structural fault has
+// produced the bytes the format says, and nothing in the format
+// confirms they are the bytes the compressor started from.  A caller
+// that needs that guarantee brings its own, and `has_checksum` says so
+// as a value rather than leaving the absence to be noticed.
+
+use brotlierror
+use brotlistream
+
+// What one step of the decoder did.
+pub enum BroStep
+    // Bytes were produced.  `count` of them were written into the
+    // caller's buffer.
+    BroProduced(count: Int)
+    // The decoder has consumed everything it was fed and wants more
+    // compressed bytes.
+    BroNeedMore
+    // The caller's output buffer is full and the decoder is holding
+    // finished bytes.  Drain and step again; do NOT feed.
+    //
+    // NOT spelled `BroOutputFull`: `BroFault` already declares that
+    // name, and a variant is constructed by NAME rather than by the
+    // type the expression expects (`docs/publishing.md` § Public type
+    // names are globally unique), so two variants with one spelling is
+    // `E2031` at the first call site that uses either.  The compiler
+    // caught it here; the rule is the same one that makes a package's
+    // variant names its own business.
+    BroWantsDrain
+    // The last meta-block was consumed and the stream is complete.
+    BroDone
+
+// A decode in progress.
+//
+// Holds the window, the current meta-block's state, and the position
+// in the stream.  Everything a caller needs to know about it is a
+// function below; the fields are not public because their shape is
+// the implementation's to choose and pinning it here would make the
+// first optimisation a breaking change.
+pub struct BroDecoder
+    // The sliding window, sized from the caller's budget and the
+    // stream's header.
+    window: Bytes
+    // How many bytes of the window are live.
+    window_len: Int
+    // How many bytes the decoder has produced since the start of the
+    // stream.  THE NUMBER `brotlidist.resolve` NEEDS: it is what
+    // decides a back reference from a dictionary reference.
+    produced: Int
+    // Where the decoder is in the compressed stream, in bits.
+    bit_pos: Int
+    // Which internal state the machine is in.  An `Int` rather than an
+    // enum because the set is the implementation's business and a
+    // public enum would make adding a state a breaking change.
+    state: Int
+    // The last fault, or 0.  Kept so `is_failed` can answer without
+    // the caller having held on to a `Result`.
+    fault_code: Int
+
+// Start a decode.
+//
+// The header is parsed here, so a window the caller will not allow is
+// refused before anything is allocated — `BroWindowTooLarge` carrying
+// what the stream asked for and what the budget was.
+//
+// ```novo ignore
+// var d = brotlidec.decoder(head, brotlistream.small_limits())!
+// loop
+//     match brotlidec.step(d, chunk, out)
+//         BroProduced(n) => { sink(out, n); d = brotlidec.advanced(d) }
+//         BroNeedMore    => chunk = read_more()
+//         BroWantsDrain  => drain(out)
+//         BroDone        => break
+// ```
+pub fn decoder(head: Bytes,
+               limits: brotlistream.BroLimits) -> Result<BroDecoder, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidec.decoder")
+
+// Feed compressed bytes.
+//
+// The decoder does NOT keep the chunk: it consumes what it can and
+// reports how many bytes it took, so the caller's buffer is the
+// caller's and a chunk larger than the decoder wants is not copied.
+pub fn feed(d: BroDecoder, chunk: Bytes) -> Result<BroDecoder, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidec.feed")
+
+// How many bytes of the last chunk the decoder has not consumed.
+//
+// Published so a test can assert the decoder is not accumulating, and
+// so a caller re-feeding knows where to resume.  Bounded by the
+// longest single symbol the format can write, which is a constant and
+// not a function of the input.
+pub fn pending_input(d: BroDecoder) -> Int []
+    todo("brotli-nv.brotlidec.pending_input")
+
+// Run one step, writing into the caller's buffer.
+//
+// `out` is the caller's own bytes and `at` where to start writing;
+// what comes back says how far it got.  The buffer is the caller's
+// because that is what keeps the decoder's memory a function of the
+// WINDOW rather than of the output, which is the whole reason a
+// four-byte stream cannot ask for a gigabyte of it.
+pub fn step(d: BroDecoder, out: Bytes, at: Int) -> BroStep []
+    todo("brotli-nv.brotlidec.step")
+
+// The decoder after the step that produced bytes.
+//
+// A separate call because `step` answers what HAPPENED and this
+// answers the state AFTER — and a single function returning both would
+// be a tuple every caller destructures at the top of a loop.
+pub fn advanced(d: BroDecoder) -> BroDecoder []
+    todo("brotli-nv.brotlidec.advanced")
+
+// Whether the stream is complete.
+pub fn is_done(d: BroDecoder) -> Bool []
+    todo("brotli-nv.brotlidec.is_done")
+
+// Whether the decoder has failed and will not make progress.
+pub fn is_failed(d: BroDecoder) -> Bool []
+    todo("brotli-nv.brotlidec.is_failed")
+
+// The fault the decoder failed with, or nothing.
+pub fn fault_of(d: BroDecoder) -> ?brotlierror.BroFault []
+    todo("brotli-nv.brotlidec.fault_of")
+
+// How many bytes the decoder has produced since the start.
+//
+// The number a caller enforcing `max_output` watches, and the same
+// number `brotlidist.resolve` is given.
+pub fn produced(d: BroDecoder) -> Int []
+    todo("brotli-nv.brotlidec.produced")
+
+// How many bytes the window occupies.
+//
+// The decoder's whole memory cost, published so a caller can assert
+// it against the budget it set.
+pub fn window_bytes(d: BroDecoder) -> Int []
+    todo("brotli-nv.brotlidec.window_bytes")
+
+// ── For a caller that has the whole thing ────────────────────────────
+
+// Decompress a whole stream a caller already holds.
+//
+// The convenience, with the same budget: `BroLimits.max_output` is not
+// optional here and there is no variant without it. A stream that
+// expands past the bound is refused at the byte it crossed, which is
+// the shape a decompression bomb takes and the reason the unbounded
+// twin does not exist.
+pub fn decompress(src: Bytes,
+                  limits: brotlistream.BroLimits) -> Result<Bytes, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidec.decompress")
+
+// How many bytes a stream would produce, without producing them.
+//
+// Runs the decode and counts, holding only the window — so a caller
+// deciding whether to accept a response can ask what it would cost
+// before it spends the memory. Bounded by the same `max_output`.
+pub fn decompressed_size(src: Bytes,
+                         limits: brotlistream.BroLimits) -> Result<Int, brotlierror.BroFault> []
+    todo("brotli-nv.brotlidec.decompressed_size")
+
+// Whether the format carries a checksum: false.
+//
+// A function rather than a sentence in a README, because it is a
+// property a caller may need to assert on. Brotli has no integrity
+// check of any kind, unlike gzip's CRC32 and zstd's XXH64 — a
+// structurally valid stream is accepted whatever it decodes to, and a
+// caller that needs to know the bytes are the ones that went in brings
+// its own.
+pub fn has_checksum() -> Bool []
+    todo("brotli-nv.brotlidec.has_checksum")

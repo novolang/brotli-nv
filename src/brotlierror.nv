@@ -1,0 +1,130 @@
+// brotlierror.nv — what a Brotli stream can be refused for, and the
+// one thing that looks like a refusal and is not.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ABSENCE WORTH NAMING FIRST.  There is no `BroDistanceTooFar`.
+// In every other LZ format a backward reference past the start of the
+// output is a corrupt stream; in Brotli it is a reference into the
+// STATIC DICTIONARY, and a decoder that refused it would reject a
+// large share of the HTTP responses on the web while one that clamped
+// it would answer plausible garbage.  `brotlidist.resolve` turns that
+// number into a typed answer instead — see its module, which is this
+// package's load-bearing interface.
+//
+// WHAT IS REFUSED is a stream whose own arithmetic does not close: a
+// window the caller did not budget for, a prefix code that is not a
+// complete code, a meta-block whose length contradicts its contents,
+// a transform id the specification does not define.  Each carries the
+// numbers, because a caller looking at a broken response wants to know
+// which byte lied.
+
+// What went wrong.
+//
+// `at` is the byte offset in the COMPRESSED stream, counted from the
+// first byte the decoder was ever fed, so a caller with the response
+// body in hand can look at it.
+pub enum BroFault
+    // The stream header asks for a window larger than the caller
+    // budgeted for.  `want` is the window the header demands in bytes,
+    // `limit` what `BroLimits.max_window` allowed.
+    //
+    // THE REFUSAL THAT MATTERS.  `WBITS` runs to 24 in the base format
+    // and to 30 under the large-window extension, so a header can ask
+    // for a gigabyte.  The number crosses the interface before anything
+    // is allocated, which is what makes this a refusal rather than an
+    // allocator failure with a stranger's number in it.
+    BroWindowTooLarge(want: Int, limit: Int)
+    // The window bits field holds a combination the format does not
+    // define — the reserved encoding, or a large-window value in a
+    // stream that did not enable the extension.
+    BroBadWindowBits(bits: Int)
+    // More bits were needed than the stream had left.
+    //
+    // Not the same as "feed me more": a feed-and-drain decoder answers
+    // `BroNeedMore` for that, and this is the truncation that is
+    // discovered only when the stream has ENDED.
+    BroTruncated(at: Int, need: Int)
+    // A prefix code's lengths do not form a complete code: they leave a
+    // hole, or they overflow the Kraft sum.
+    //
+    // `total` is the Kraft sum scaled to 32768, so `32768` is complete,
+    // less is a hole and more is an overflow — one number for two
+    // faults, because a caller reporting on a stream wants to say which
+    // way it was wrong.
+    BroBadPrefixCode(at: Int, total: Int)
+    // A simple prefix code declared a symbol count outside 1 to 4, or
+    // repeated a symbol.
+    BroBadSimpleCode(at: Int, count: Int)
+    // A meta-block header is self-contradictory: an uncompressed block
+    // whose length does not fit, a metadata block with a non-zero
+    // length nibble where the format requires zero, or a reserved bit
+    // set.
+    BroBadMetaBlock(at: Int, field: Str)
+    // The block-switch machinery asked for a block type past the count
+    // the meta-block declared.
+    BroBadBlockType(at: Int, kind: Int, count: Int)
+    // A context mode outside 0 to 3, or a context map whose run-length
+    // encoding overruns its declared size.
+    BroBadContextMap(at: Int, size: Int)
+    // A dictionary reference names a word length outside 4 to 24, or a
+    // word index past the number of words of that length.
+    BroBadDictWord(length: Int, index: Int)
+    // A dictionary reference names a transform this package does not
+    // apply.  `brotlidict.transform_count` is how many there are.
+    BroBadTransform(id: Int)
+    // The decoder produced more bytes than the meta-block's declared
+    // length, which means the stream disagrees with itself.
+    BroLengthMismatch(declared: Int, produced: Int)
+    // The encoder was asked for a quality level it does not implement.
+    // `brotlienc.quality_range` is the pair it does.
+    BroBadQuality(want: Int)
+    // The caller's output buffer has no room left and the decoder has
+    // more to give.
+    //
+    // Not a failure of the stream: it is the decoder saying the caller
+    // must drain.  Separate from `BroNeedMore` because the two ask the
+    // caller for opposite things.
+    BroOutputFull(pending: Int)
+
+// Whether the fault is about a budget the caller chose rather than
+// about the stream.
+//
+// True for `BroWindowTooLarge` and `BroOutputFull`.  Published because
+// the response is different in kind — raise the budget, or drain —
+// from every other fault here, which all mean the bytes are wrong.
+pub fn is_budget(f: BroFault) -> Bool []
+    todo("brotli-nv.brotlierror.is_budget")
+
+// Where in the compressed stream the fault was found, or -1 when the
+// fault is not about a position.
+pub fn fault_at(f: BroFault) -> Int []
+    todo("brotli-nv.brotlierror.fault_at")
+
+// One line a person can read, naming the numbers.
+//
+// ```novo
+// use brotlierror
+//
+// fn main() [io]
+//     println(brotlierror.describe(BroWindowTooLarge(16777216, 1048576)))
+// ```
+pub fn describe(f: BroFault) -> Str []
+    todo("brotli-nv.brotlierror.describe")
+
+// The `Error` implementation `Result<_, BroFault>` requires.
+//
+// Required before `Result<_, BroFault>` type-checks at all
+// (SPEC § 3.4), so this block is part of the interface rather than a
+// convenience on top of it.
+//
+// ```novo
+// use brotlierror
+//
+// fn main() [io]
+//     let e: BroFault = BroBadTransform(200)
+//     println(e.message())
+// ```
+impl Error for BroFault
+    fn message(self) -> Str
+        todo("brotli-nv.brotlierror.message")

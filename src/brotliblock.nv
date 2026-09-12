@@ -1,0 +1,220 @@
+// brotliblock.nv — meta-blocks: how much, of what kind, and whether
+// it is the last one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A BROTLI STREAM IS A SEQUENCE OF META-BLOCKS and nothing else.  Each
+// one declares its uncompressed length, says whether it is compressed
+// data, stored bytes or metadata, and says whether it is the last.
+// Three bits of header decide which of four shapes the rest of the
+// header takes, and getting that dispatch wrong is how a decoder ends
+// up reading a length field out of the middle of a prefix code.
+//
+// THE FOUR SHAPES, EACH NAMED.  `ISLAST` and `ISLASTEMPTY` together
+// mean a stream may end with a block that has no length field at all.
+// `MNIBBLES` of 7 means the block is METADATA — skipped bytes that are
+// not part of the output — and a decoder that treated them as data
+// produces the right length of wrong bytes.  `ISUNCOMPRESSED` means
+// the payload is stored after a byte boundary, which is the only place
+// in the format where the bit reader must align.  And the ordinary
+// case is compressed data.
+//
+// WHY THE HEADER IS ITS OWN VALUE.  Because the decoder needs the
+// length, the kind and the last flag at three different points — the
+// length to bound the output, the kind to choose a path, the flag to
+// know whether to expect another header — and a function that answered
+// only one of them would be called three times over the same bits.
+
+use brotlierror
+
+// What a meta-block carries.
+pub enum BroBlockKind
+    // Prefix-coded literals, insert-and-copy commands and distances:
+    // the ordinary case, and the only one that uses the window.
+    BroCompressed
+    // Bytes stored verbatim after a byte boundary.  What an encoder
+    // emits for data that does not compress, and the only place the
+    // bit reader aligns.
+    BroStored
+    // Bytes that are NOT part of the output.  A decoder that appended
+    // them produces the right number of wrong bytes, which no length
+    // check catches.
+    BroMetadata
+    // A last block with no length field: the stream ends here and this
+    // block contributes nothing.
+    BroLastEmpty
+
+// One meta-block's header.
+pub struct BroBlockHeader
+    // What the block carries.
+    kind: BroBlockKind
+    // How many bytes of OUTPUT it produces.  Zero for metadata and for
+    // the empty last block — metadata's own byte count is `skip_len`,
+    // which is a different number for a different purpose.
+    length: Int
+    // How many bytes of the input a metadata block covers, which the
+    // decoder must skip and must not emit.  Zero for every other kind.
+    skip_len: Int
+    // Whether the stream ends after this block.
+    is_last: Bool
+    // How many BITS of the stream the header consumed, so a caller
+    // driving its own reader knows where the payload begins.
+    header_bits: Int
+
+// Parse a meta-block header from the bit position a caller is at.
+//
+// `at_bit` is where in `src` the header begins, which the previous
+// block's own accounting gave.  A bit position rather than a byte one
+// because meta-blocks are not byte-aligned — only a stored block's
+// payload is — and a caller that rounded would start the next header
+// in the middle of the previous one.
+pub fn parse_header(src: Bytes, at_bit: Int) -> Result<BroBlockHeader, brotlierror.BroFault> []
+    todo("brotli-nv.brotliblock.parse_header")
+
+// The largest output one meta-block may declare: 16 MiB.
+//
+// `MNIBBLES` runs to 6, so the length field holds 24 bits and the
+// block declares at most `1 << 24`.  Published because it is the bound
+// a caller sizing a per-block buffer needs, and because it is NOT the
+// same as the window size — a common confusion, since the two numbers
+// coincide at the largest window.
+pub fn max_block_length() -> Int []
+    todo("brotli-nv.brotliblock.max_block_length")
+
+// Whether the block's payload begins on a byte boundary.
+//
+// True only for `BroStored` and `BroMetadata`.  The one place the bit
+// reader aligns, published so a caller driving its own reader does not
+// have to infer it from the kind.
+pub fn payload_is_aligned(h: BroBlockHeader) -> Bool []
+    todo("brotli-nv.brotliblock.payload_is_aligned")
+
+// Where the payload begins, as a BIT position.
+pub fn payload_at(h: BroBlockHeader, at_bit: Int) -> Int []
+    todo("brotli-nv.brotliblock.payload_at")
+
+// Whether the block contributes anything to the output.
+//
+// False for metadata and for the empty last block.  The predicate a
+// decoder's loop reads rather than a two-armed `match` in three
+// places.
+pub fn produces_output(h: BroBlockHeader) -> Bool []
+    todo("brotli-nv.brotliblock.produces_output")
+
+// ── The three prefix-code categories ─────────────────────────────────
+
+// Which family of prefix codes a symbol belongs to.
+//
+// A compressed meta-block declares its own prefix codes for three
+// alphabets, and the block-switch machinery runs independently for
+// each — which is why the category is a value rather than three
+// parallel sets of functions.
+pub enum BroCategory
+    // Literal bytes.
+    BroLiterals
+    // Insert-and-copy length pairs.
+    BroInsertCopy
+    // Distances.
+    BroDistances
+
+// How many block types a category declared for this meta-block.
+//
+// `BroBadBlockType` when a switch names a type past this.
+pub fn block_type_count(counts: [Int], c: BroCategory) -> Int []
+    todo("brotli-nv.brotliblock.block_type_count")
+
+// The block-switch state for one category.
+//
+// `@value`: three integers carried through the decode of a
+// meta-block, never a `Result` payload.
+//
+// The PREVIOUS type is in the state because two of the three
+// block-type codes are relative — "the one before this" and "the next
+// one round" — and a decoder that kept only the current type decodes
+// them wrong from the second switch onward.
+pub @value
+struct BroBlockState
+    // The type currently in effect.
+    current: Int
+    // The type in effect before it, which the relative codes need.
+    previous: Int
+    // How many symbols are left before the next switch.
+    remaining: Int
+
+// The state a category starts a meta-block in: type 0, previous 1,
+// and a run length the header gave.
+//
+// PREVIOUS IS 1, not 0, and that is from the specification rather than
+// a choice: a stream whose first block-type code is the relative one
+// selects type 1, and a decoder that seeded both to 0 selects type 0
+// and decodes the whole block with the wrong prefix code.
+pub fn initial_block_state(first_run: Int) -> BroBlockState []
+    todo("brotli-nv.brotliblock.initial_block_state")
+
+// The state after one symbol has been consumed.
+pub fn consume(s: BroBlockState) -> BroBlockState []
+    todo("brotli-nv.brotliblock.consume")
+
+// Whether the next symbol needs a block switch read first.
+pub fn needs_switch(s: BroBlockState) -> Bool []
+    todo("brotli-nv.brotliblock.needs_switch")
+
+// The state after a block-switch code and its run length.
+//
+// `code` is the block-type code as read: 0 means the previous type, 1
+// means the next one round, and anything else is `code - 2` directly.
+// The three readings are here rather than at the call site because
+// two of them are relative and both are easy to get backwards.
+pub fn switch_to(s: BroBlockState, code: Int, type_count: Int, run: Int) -> BroBlockState []
+    todo("brotli-nv.brotliblock.switch_to")
+
+// ── Insert-and-copy ──────────────────────────────────────────────────
+
+// One command: how many literals to emit, then how many bytes to copy.
+//
+// `@value`: three integers produced per command and consumed
+// immediately, never a `Result` payload.
+pub @value
+struct BroCommand
+    // How many literal bytes precede the copy.
+    insert: Int
+    // How many bytes to copy.  Zero on the LAST command of a
+    // meta-block, which is the only place a copy length may be zero
+    // and is how a block that ends in literals is encoded.
+    copy: Int
+    // Whether the distance is the last one used rather than a coded
+    // one.
+    //
+    // The implicit-distance case: insert-and-copy codes below 128 do
+    // not carry a distance at all and reuse `d0`.  A decoder that read
+    // a distance code for them consumes bits that belong to the next
+    // command, and everything after is noise.
+    implicit_distance: Bool
+
+// What an insert-and-copy code means.
+//
+// The code is one number covering both lengths through a table of
+// ranges plus extra bits, which is where the format is at its least
+// readable and where a hand-written decoder has its off-by-ones.
+pub fn command_of(code: Int, insert_extra: Int, copy_extra: Int) -> BroCommand []
+    todo("brotli-nv.brotliblock.command_of")
+
+// How many extra bits the insert half of a code carries.
+pub fn insert_extra_bits(code: Int) -> Int []
+    todo("brotli-nv.brotliblock.insert_extra_bits")
+
+// How many extra bits the copy half carries.
+pub fn copy_extra_bits(code: Int) -> Int []
+    todo("brotli-nv.brotliblock.copy_extra_bits")
+
+// Whether a code reuses the last distance rather than reading one.
+//
+// True below 128.  Its own predicate because it is the rule that
+// desynchronises a decoder completely when missed, and a caller
+// auditing a stream wants to count them.
+pub fn uses_implicit_distance(code: Int) -> Bool []
+    todo("brotli-nv.brotliblock.uses_implicit_distance")
+
+// How many insert-and-copy codes the alphabet has: 704.
+pub fn command_alphabet_size() -> Int []
+    todo("brotli-nv.brotliblock.command_alphabet_size")

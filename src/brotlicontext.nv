@@ -1,0 +1,167 @@
+// brotlicontext.nv — which prefix code to use for the next symbol,
+// given the two bytes before it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS WHAT BROTLI HAS THAT DEFLATE DOES NOT.  A deflate stream has
+// one literal code per block.  A Brotli meta-block has up to 256, and
+// which one decodes the next literal depends on the two PREVIOUS
+// bytes of output through a context mode and a context map.  That is
+// most of the format's advantage on text: after `<`, the next byte is
+// overwhelmingly a letter; after a digit, another digit; and a code
+// per context spends far fewer bits than one code for all of them.
+//
+// FOUR MODES, AND THE MODE IS PER BLOCK TYPE.  `LSB6` and `MSB6` take
+// six bits of the previous byte; `UTF8` is a small classification of
+// the previous two bytes designed for text; `SIGNED` is for numeric
+// data.  The mode is declared once per literal block type, so a
+// meta-block that switches block types switches context modes with it
+// — and a decoder that read the mode once decodes the second block
+// type's literals with the first one's contexts.
+//
+// AND THE MAP IS RUN-LENGTH CODED WITH AN INVERSE MOVE-TO-FRONT PASS.
+// The context map is up to 64 KiB of small integers, so it is written
+// compressed: a prefix code, run-length zeroes, and then optionally
+// an inverse MTF over the result.  The MTF flag is one bit and
+// forgetting it produces a map that is a permutation of the right one
+// — which decodes to plausible bytes and no error.
+//
+// DISTANCES HAVE CONTEXTS TOO, and a smaller one: four contexts from
+// the copy length. Same map machinery, different alphabet, and the
+// two are separate calls so a caller cannot pass one map where the
+// other belongs.
+
+use brotlierror
+
+// How the two previous bytes become a context number.
+pub enum BroContextMode
+    // The low six bits of the previous byte.
+    BroLsb6
+    // The high six bits of the previous byte.
+    BroMsb6
+    // A classification of the previous two bytes for text: which of
+    // several classes the last byte falls in, combined with whether
+    // the one before it was a space or a punctuation mark.  The mode a
+    // web page's literals actually use.
+    BroUtf8
+    // The previous two bytes read as a small signed quantity, for
+    // numeric and binary data.
+    BroSigned
+
+// A context map: one prefix-code index per context.
+//
+// A struct rather than a bare `[Int]` because the number of trees is a
+// fact about the map that a caller validating a block-type switch
+// needs, and because it is what bounds the index a corrupt stream can
+// name.
+pub struct BroContextMap
+    // One tree index per context, `context_count` entries long.
+    tree_of: [Int]
+    // How many distinct prefix codes the map refers to.  A stream that
+    // names more than this in the map is `BroBadContextMap`.
+    tree_count: Int
+    // Whether the stream applied the inverse move-to-front pass.  Kept
+    // so a tool can report it and a re-encoder can reproduce the
+    // stream byte for byte.
+    used_mtf: Bool
+
+// How many contexts a literal block type has: 64.
+pub fn literal_context_count() -> Int []
+    todo("brotli-nv.brotlicontext.literal_context_count")
+
+// How many contexts a distance block type has: 4.
+//
+// Four rather than 64, because the distance context is the copy
+// length clamped — a short copy and a long one want different
+// distance distributions, and nothing finer helps.
+pub fn distance_context_count() -> Int []
+    todo("brotli-nv.brotlicontext.distance_context_count")
+
+// The mode a number names.
+//
+// `BroBadContextMap` outside 0 to 3.
+pub fn mode_of(code: Int) -> Result<BroContextMode, brotlierror.BroFault> []
+    todo("brotli-nv.brotlicontext.mode_of")
+
+// The context the two previous bytes give under a mode.
+//
+// `p1` is the byte immediately before the one being decoded and `p2`
+// the one before that; both are 0 at the start of a meta-block, which
+// is from the specification and not a convenience — a decoder that
+// carried them across meta-blocks decodes the first literals of every
+// block but the first with the wrong code.
+//
+// ```novo
+// use brotlicontext
+//
+// fn main() [io]
+//     println("${brotlicontext.literal_context(BroLsb6, 65, 0)}")
+// ```
+pub fn literal_context(mode: BroContextMode, p1: Int, p2: Int) -> Int []
+    todo("brotli-nv.brotlicontext.literal_context")
+
+// The distance context a copy length gives.
+//
+// `copy - 2` clamped to 0 to 3, which is the whole rule — published
+// because it reads as arbitrary and because a caller that guessed
+// `copy` or `copy - 1` would be wrong on every short copy.
+pub fn distance_context(copy_length: Int) -> Int []
+    todo("brotli-nv.brotlicontext.distance_context")
+
+// ── The map ──────────────────────────────────────────────────────────
+
+// Read a context map.
+//
+// `size` is the number of entries the map must have — the block-type
+// count times the context count for its category — and a map that
+// decodes to a different number of entries is `BroBadContextMap`
+// carrying both.
+//
+// The inverse move-to-front pass is applied when the stream's flag
+// says so, inside this call, because a caller that had to remember it
+// would get a map that is a permutation of the right one and produces
+// plausible bytes with no error anywhere.
+pub fn read_map(src: Bytes, at_bit: Int, size: Int,
+                tree_count: Int) -> Result<BroContextMap, brotlierror.BroFault> []
+    todo("brotli-nv.brotlicontext.read_map")
+
+// How many BITS the map occupied.
+pub fn map_bits(m: BroContextMap) -> Int []
+    todo("brotli-nv.brotlicontext.map_bits")
+
+// The prefix-code index for a block type and a context.
+//
+// `block_type * context_count + context`, bounds-checked.  The
+// arithmetic is one line and is here rather than at the call site
+// because the two factors are easy to write in the wrong order and
+// the result is a valid index into a valid map.
+pub fn tree_for(m: BroContextMap, block_type: Int, context: Int, context_count: Int) -> Int []
+    todo("brotli-nv.brotlicontext.tree_for")
+
+// How many entries the map holds.
+pub fn map_size(m: BroContextMap) -> Int []
+    todo("brotli-nv.brotlicontext.map_size")
+
+// Whether every entry is inside the tree count.
+//
+// The check `read_map` makes, published so a caller validating a
+// stream it received can make it without re-reading.
+pub fn map_is_sound(m: BroContextMap) -> Bool []
+    todo("brotli-nv.brotlicontext.map_is_sound")
+
+// The identity map: every context on tree 0.
+//
+// What a meta-block with one literal tree has, and what an encoder at
+// quality 0 emits.  Published so a decoder has one value for the case
+// where no map was written at all, rather than a `?BroContextMap` that
+// every call site has to unwrap.
+pub fn identity_map(size: Int) -> BroContextMap []
+    todo("brotli-nv.brotlicontext.identity_map")
+
+// The inverse move-to-front transform over a byte list.
+//
+// Published on its own because it is the one piece of this module a
+// test can check against a hand-worked example, and because an encoder
+// needs the forward direction of the same table.
+pub fn inverse_mtf(v: [Int]) -> [Int] []
+    todo("brotli-nv.brotlicontext.inverse_mtf")

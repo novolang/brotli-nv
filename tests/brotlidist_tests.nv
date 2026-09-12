@@ -1,0 +1,134 @@
+// brotlidist_tests.nv — one number, three meanings, and the one that
+// every other LZ format calls corrupt.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: a distance larger than the
+// number of bytes produced so far is a DICTIONARY REFERENCE, not an
+// error.  A decoder that refused it rejects a large share of real HTTP
+// responses; one that clamped it answers plausible garbage that no
+// checksum catches, because Brotli has no checksum.  `resolve` answers
+// a typed value so neither mistake is spellable.
+//
+// THE VECTORS are RFC 7932's own: the seeded distance cache (16, 15,
+// 11, 4), the alphabet size formula of § 4, and the 4-to-24 word
+// length range of § 8.
+
+use std.test
+use std.list
+use brotlidist
+use brotlidict
+use brotlierror
+
+@test
+fn test_a_distance_past_the_output_is_a_dictionary_word_and_not_an_error() [io]
+    let p = brotlidist.default_params()
+    let c = brotlidist.initial_cache()
+
+    test.case("THE CLAIM: the distance the format calls corrupt is the one it uses most")
+    test.assert(brotlidist.reaches_dictionary(5000, 100))
+    test.assert(brotlidist.reaches_dictionary(50, 100) == false)
+
+    test.case("so an ordinary back reference resolves to a back reference")
+    match brotlidist.resolve(p, c, 20, 0, 10000, 6)
+        BroBackRef(d, n) =>
+            test.assert(d > 0)
+            test.assert(n == 6)
+        _                => test.assert(false)
+
+    test.case("and a distance past the output resolves to a WORD, a LENGTH and a TRANSFORM")
+    match brotlidist.resolve(p, c, 40, 0, 4, 6)
+        BroDictWord(len, ix, t) =>
+            test.assert(len >= 4)
+            test.assert(len <= 24)
+            test.assert(ix >= 0)
+            test.assert(t >= 0)
+        _                       => test.assert(false)
+
+    test.case("which a caller cannot forget, because the match has three arms")
+    test.assert(list.len(brotlidist.dict_length_range()) == 2)
+
+@test
+fn test_the_only_corrupt_case_sits_beside_the_two_good_ones() [io]
+    let p = brotlidist.default_params()
+    let c = brotlidist.initial_cache()
+
+    test.case("THE CLAIM: a copy length outside 4 to 24 cannot be a dictionary word")
+    match brotlidist.resolve(p, c, 40, 0, 4, 2)
+        BroDistOutOfRange(d, produced) =>
+            test.assert(d > produced)
+        _                              => test.assert(false)
+
+    test.case("and it converts to a fault for a caller that would rather propagate")
+    match brotlidist.out_of_range_fault(BroDistOutOfRange(9000, 4))
+        Some(f) => test.assert(brotlierror.is_budget(f) == false)
+        None    => test.assert(false)
+
+    test.case("while a good reference has no fault to convert")
+    test.assert(brotlidist.out_of_range_fault(BroBackRef(10, 6)) == None)
+
+@test
+fn test_the_distance_cache_is_SEEDED_and_a_decoder_that_zeroed_it_is_wrong() [io]
+    let c = brotlidist.initial_cache()
+
+    test.case("THE CLAIM: 16, 15, 11, 4 — from the specification, not a convenience")
+    test.assert(c.d0 == 16)
+    test.assert(c.d1 == 15)
+    test.assert(c.d2 == 11)
+    test.assert(c.d3 == 4)
+
+    test.case("because a stream may reference the cache before it has produced a distance")
+    test.assert(brotlidist.is_cache_code(0))
+    test.assert(brotlidist.is_cache_code(15))
+    test.assert(brotlidist.is_cache_code(16) == false)
+
+@test
+fn test_reusing_d0_does_not_move_the_cache_and_everything_else_does() [io]
+    let c = brotlidist.initial_cache()
+
+    test.case("THE CLAIM: code 0 names d0 and leaves the cache alone")
+    let same = brotlidist.push(c, 0, 16)
+    test.assert(same.d0 == 16)
+    test.assert(same.d1 == 15)
+
+    test.case("and any other distance pushes, dropping the oldest")
+    let moved = brotlidist.push(c, 20, 900)
+    test.assert(moved.d0 == 900)
+    test.assert(moved.d1 == 16)
+    test.assert(moved.d2 == 15)
+    test.assert(moved.d3 == 11)
+
+@test
+fn test_the_three_ranges_are_three_predicates_rather_than_boundary_arithmetic() [io]
+    let plain = brotlidist.default_params()
+    let with_direct = BroDistParams { npostfix: 2, ndirect: 16 }
+
+    test.case("THE CLAIM: the alphabet size is 16 + ndirect + (48 << npostfix)")
+    test.assert(brotlidist.alphabet_size(plain) == 16 + 0 + 48)
+    test.assert(brotlidist.alphabet_size(with_direct) == 16 + 16 + 192)
+
+    test.case("with no direct codes the postfix range begins at 16")
+    test.assert(brotlidist.is_direct_code(plain, 16) == false)
+    test.assert(brotlidist.is_postfix_code(plain, 16))
+
+    test.case("and with sixteen of them it begins at 32")
+    test.assert(brotlidist.is_direct_code(with_direct, 16))
+    test.assert(brotlidist.is_direct_code(with_direct, 31))
+    test.assert(brotlidist.is_postfix_code(with_direct, 32))
+
+    test.case("a cache code and a direct code carry no extra bits")
+    test.assert(brotlidist.extra_bits(plain, 0) == 0)
+    test.assert(brotlidist.extra_bits(with_direct, 20) == 0)
+
+@test
+fn test_the_window_bounds_what_a_back_reference_can_reach() [io]
+    test.case("THE CLAIM: past the window is the dictionary, and the window is the caller's")
+    test.assert(brotlidist.max_backward(65536) == 65536)
+
+    test.case("and the dictionary's own length range is what bounds a word reference")
+    let r = brotlidist.dict_length_range()
+    test.assert(r[0] == 4)
+    test.assert(r[1] == 24)
+    test.assert(brotlidict.length_range()[0] == r[0])
+    test.assert(brotlidict.length_range()[1] == r[1])

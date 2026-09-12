@@ -1,0 +1,155 @@
+// brotlistream.nv — the first few bits: how big a window the stream
+// wants, and whether the caller will give it one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE WINDOW IS THE CALLER'S BUDGET, WHICH IS THE ONE DECISION IN THIS
+// MODULE.  A Brotli stream opens with a variable-length `WBITS` field
+// that asks for a sliding window of up to 16 MiB — and up to a
+// gigabyte under the large-window extension.  A decoder that read the
+// number and allocated would be a denial of service with a decompressor
+// on the front: a four-byte response body can ask for a gigabyte.
+//
+// So `parse_header` answers what the stream ASKS for, `BroLimits` is
+// what the caller ALLOWS, and `BroWindowTooLarge` carries both numbers
+// when they disagree.  zstd-nv answers the same question the same way
+// and for the same reason; naming the shared shape is more useful than
+// two packages each discovering it.
+//
+// THE HEADER HAS NO MAGIC, which is the other thing worth saying out
+// loud.  gzip has `1f 8b`, zstd has a four-byte frame magic, PNG has
+// eight bytes of signature.  Brotli has nothing: the first bits ARE
+// the window field, so there is no way to look at a buffer and know it
+// is Brotli.  `looks_like_brotli` is a heuristic and says so in its own
+// name; the real answer comes from the `Content-Encoding` header, and
+// that is why `content_encoding_token` is published here.
+
+use brotlierror
+
+// What the caller allows a stream to ask for.
+//
+// `@value`: two integers passed into every decode, never a `Result`
+// payload.
+pub @value
+struct BroLimits
+    // The largest sliding window, in bytes, the caller will provide.
+    // A stream whose header asks for more is refused with both numbers
+    // BEFORE anything is allocated.
+    max_window: Int
+    // The largest total output the caller will accept from one stream,
+    // or 0 for no bound.
+    //
+    // The other half of the budget, and the one a naive limit misses:
+    // a window bound stops a large ALLOCATION, and this stops a small
+    // input expanding without end — which is the shape a compression
+    // bomb takes.
+    max_output: Int
+
+// The stream's own header.
+pub struct BroHeader
+    // `WBITS` as the field encodes it, 10 to 24 in the base format.
+    window_bits: Int
+    // The window size those bits name, in bytes: `(1 << bits) - 16`.
+    //
+    // The MINUS SIXTEEN is not a typo and is the field most readers of
+    // the specification miss: Brotli's window is sixteen bytes short of
+    // a power of two, so a decoder that allocated `1 << bits` is fine
+    // and one that computed a maximum distance of `1 << bits` accepts
+    // streams the format does not allow.
+    window_size: Int
+    // Whether the header used the large-window extension's encoding.
+    large_window: Bool
+    // How many BITS of the stream the header consumed, so a caller
+    // driving its own bit reader knows where the first meta-block
+    // begins.
+    header_bits: Int
+
+// The default budget: a 16 MiB window and no output bound.
+//
+// 16 MiB is what the base format's largest `WBITS` asks for, so the
+// default accepts every conformant stream and nothing more.  A server
+// decompressing request bodies should lower both, and the fact that it
+// has to say so is the point.
+pub fn default_limits() -> BroLimits []
+    todo("brotli-nv.brotlistream.default_limits")
+
+// A budget for a caller that knows its inputs are small.
+//
+// A 64 KiB window and a 16 MiB output bound — the shape an HTTP server
+// accepting compressed request bodies wants, where the client chooses
+// the bytes and the server chooses the ceiling.
+pub fn small_limits() -> BroLimits []
+    todo("brotli-nv.brotlistream.small_limits")
+
+// Parse the stream header.
+//
+// Reads at most 21 bits.  `BroBadWindowBits` for the reserved
+// encoding; `BroWindowTooLarge` carrying both numbers when the window
+// the header asks for is past the budget.
+//
+// ```novo ignore
+// match brotlistream.parse_header(compressed, brotlistream.small_limits())
+//     Ok(h)  => println("${h.window_size} byte window")
+//     Err(e) => println(e.message())
+// ```
+pub fn parse_header(src: Bytes, limits: BroLimits) -> Result<BroHeader, brotlierror.BroFault> []
+    todo("brotli-nv.brotlistream.parse_header")
+
+// The window size a `WBITS` value names: `(1 << bits) - 16`.
+//
+// Published on its own because it is the arithmetic a caller sizing a
+// buffer does before it decides whether to decode at all, and because
+// the sixteen is the number everyone gets wrong.
+pub fn window_size_of(bits: Int) -> Int []
+    todo("brotli-nv.brotlistream.window_size_of")
+
+// The smallest and largest `WBITS` the base format allows, as a pair:
+// 10 and 24.
+pub fn window_bits_range() -> [Int] []
+    todo("brotli-nv.brotlistream.window_bits_range")
+
+// The largest `WBITS` the large-window extension allows: 30.
+//
+// Separate from the range above because it is an EXTENSION: a stream
+// using it is not RFC 7932, and a caller that accepted one without
+// deciding to would be accepting a gigabyte window from a header.
+pub fn large_window_max_bits() -> Int []
+    todo("brotli-nv.brotlistream.large_window_max_bits")
+
+// Whether a header would fit a budget, without parsing anything else.
+pub fn fits(h: BroHeader, limits: BroLimits) -> Bool []
+    todo("brotli-nv.brotlistream.fits")
+
+// ── What a caller outside this package needs to know ─────────────────
+
+// The token `Content-Encoding` uses: `br`.
+//
+// THE ONE PLACE THE TWO PACKAGES AGREE WITHOUT DEPENDING ON EACH
+// OTHER.  http-codec-nv names `Content-Encoding: br` and this package
+// decodes it, and a dependency in either direction would be wrong — a
+// codec that pulled in an HTTP parser, or an HTTP parser that pulled
+// in every codec.  So the spelling is published here, where the format
+// is, and a header writer compares against it.
+pub fn content_encoding_token() -> Str []
+    todo("brotli-nv.brotlistream.content_encoding_token")
+
+// Whether a buffer might be a Brotli stream.
+//
+// A HEURISTIC, and the name says so.  Brotli has NO magic number —
+// the first bits are the window field — so this can only rule out
+// obvious non-Brotli (a gzip magic, a zip magic, valid UTF-8 text) and
+// can never confirm.  The real answer is the `Content-Encoding` header
+// or the caller's own knowledge of where the bytes came from.
+//
+// Published anyway because a caller with a file and no header will
+// write a worse version of it otherwise.
+pub fn looks_like_brotli(src: Bytes) -> Bool []
+    todo("brotli-nv.brotlistream.looks_like_brotli")
+
+// The empty stream: the shortest byte sequence that decodes to nothing.
+//
+// One byte, `0x3b`.  Published because it is what an encoder must emit
+// for empty input and what a decoder must accept, and because a test
+// that has one round-trip vector should have this one.
+pub fn empty_stream() -> Bytes []
+    todo("brotli-nv.brotlistream.empty_stream")

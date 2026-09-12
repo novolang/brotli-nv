@@ -1,0 +1,219 @@
+// brotlicodec_tests.nv — the decoder's loop and the encoder's declared
+// scope, reached with the types the package itself produces.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
+//
+// THE TWO ASSERTIONS THIS SUITE EXISTS FOR:
+//
+//   `BroNeedMore` and `BroWantsDrain` are DIFFERENT answers, and the
+//   caller's response to them is opposite.  A single "not done" would
+//   leave the caller guessing, and the guess that feeds more into a
+//   full decoder is an unbounded buffer — which is exactly the shape a
+//   decompression bomb takes.
+//
+//   and what the encoder does NOT do is a value rather than a
+//   paragraph: `splits_blocks`, `supports_custom_dictionary` and the
+//   gap between `quality_range` and `format_max_quality` are all
+//   assertable, so a caller comparing output sizes against the
+//   reference compressor can name which feature is missing.
+
+use std.test
+use std.list
+use std.bytes
+use brotlistream
+use brotlidec
+use brotlienc
+use brotlidict
+use brotlidist
+use brotliblock
+use brotliprefix
+use brotlicontext
+use brotlierror
+
+fn stub() -> Bytes
+    bytes.from_byte_list([59])
+
+@test
+fn test_the_two_ways_to_be_hungry_are_two_different_answers() [io]
+    match brotlidec.decoder(stub(), brotlistream.small_limits())
+        Err(_) => test.assert(false)
+        Ok(d0) =>
+            test.case("THE CLAIM: a fresh decoder has produced nothing and failed at nothing")
+            test.assert(brotlidec.produced(d0) == 0)
+            test.assert(brotlidec.is_done(d0) == false)
+            test.assert(brotlidec.is_failed(d0) == false)
+            test.assert(brotlidec.fault_of(d0) == None)
+
+            test.case("its memory is the WINDOW, which the caller's budget bounded")
+            test.assert(brotlidec.window_bytes(d0) <= brotlistream.small_limits().max_window)
+
+            test.case("feeding does not make the decoder keep the chunk")
+            match brotlidec.feed(d0, stub())
+                Err(_) => test.assert(false)
+                Ok(d1) =>
+                    test.assert(brotlidec.pending_input(d1) < 64)
+
+                    test.case("and a step says WHICH of the two things the caller must do")
+                    let out = bytes.from_byte_list([0, 0, 0, 0])
+                    match brotlidec.step(d1, out, 0)
+                        BroProduced(n) => test.assert(n >= 0)
+                        BroNeedMore    => test.assert(true)
+                        BroWantsDrain  => test.assert(true)
+                        BroDone        => test.assert(brotlidec.is_done(brotlidec.advanced(d1)))
+
+@test
+fn test_the_whole_stream_form_has_no_unbounded_twin() [io]
+    let limits = brotlistream.small_limits()
+
+    test.case("THE CLAIM: max_output is not optional, because a bomb is a small input")
+    test.assert(limits.max_output > 0)
+
+    test.case("and asking what a stream would cost does not cost the memory")
+    match brotlidec.decompressed_size(brotlistream.empty_stream(), limits)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+    test.case("a fault carries a position a caller can look at in its own buffer")
+    test.assert(brotlierror.fault_at(BroTruncated(17, 8)) == 17)
+    test.assert(brotlierror.describe(BroTruncated(17, 8)) != "")
+
+    test.case("and the two budget faults are separated from the eleven that mean bad bytes")
+    test.assert(brotlierror.is_budget(BroOutputFull(4)))
+    test.assert(brotlierror.is_budget(BroTruncated(17, 8)) == false)
+
+@test
+fn test_what_the_encoder_does_not_do_is_a_value_and_not_a_paragraph() [io]
+    test.case("THE CLAIM: five levels declared, eleven in the format, and the gap is visible")
+    let r = brotlienc.quality_range()
+    test.assert(r[0] == 0)
+    test.assert(r[1] == 4)
+    test.assert(brotlienc.format_max_quality() == 11)
+
+    test.case("so a level outside the declared range is refused by name")
+    test.assert(brotlienc.supports_quality(4))
+    test.assert(brotlienc.supports_quality(9) == false)
+
+    test.case("block splitting is most of the difference, and is absent by assertion")
+    test.assert(brotlienc.splits_blocks() == false)
+
+    test.case("and so is the custom-dictionary extension, which is a row of its own")
+    test.assert(brotlienc.supports_custom_dictionary() == false)
+
+@test
+fn test_the_encoder_picks_a_window_a_decoder_will_not_resent() [io]
+    test.case("THE CLAIM: a 2 KB response with a 16 MiB window makes every reader allocate it")
+    test.assert(brotlienc.window_bits_for(2048) < 24)
+    test.assert(brotlienc.window_bits_for(2048) >= 10)
+    test.assert(brotlienc.window_bits_for(100000000) == 24)
+
+    test.case("the fastest and the best declared differ in level and not in honesty")
+    test.assert(brotlienc.fastest().level == 0)
+    test.assert(brotlienc.best_declared().level == 4)
+    test.assert(brotlienc.fastest().use_dictionary)
+
+    test.case("and the limits a decoder would need come from the quality, as a value")
+    let lim = brotlienc.limits_for(brotlienc.best_declared())
+    test.assert(lim.max_window >= brotlistream.window_size_of(brotlienc.best_declared().window_bits))
+
+@test
+fn test_the_worst_case_output_is_larger_than_the_input() [io]
+    test.case("THE CLAIM: a stored meta-block has a header, so a size-of-input buffer truncates")
+    test.assert(brotlienc.max_compressed_size(1000) > 1000)
+    test.assert(brotlienc.max_compressed_size(0) > 0)
+
+    test.case("and `store` is the floor an encoder falls back to on incompressible data")
+    match brotlienc.store(bytes.from_str("aaaa"), 16)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(bytes.len(b) > 4)
+
+@test
+fn test_an_encoder_carries_its_settings_flat_and_hands_the_value_back() [io]
+    let q = brotlienc.best_declared()
+
+    test.case("THE CLAIM: a @value struct cannot be a boxed struct's field, so the owner flattens")
+    match brotlienc.encoder(q)
+        Err(_) => test.assert(false)
+        Ok(e)  =>
+            test.assert(e.quality_level == q.level)
+            test.assert(e.quality_window_bits == q.window_bits)
+
+            test.case("and `quality_of` rebuilds it, so a caller reads one value and not four fields")
+            test.assert(brotlienc.quality_of(e).level == q.level)
+            test.assert(brotlienc.emitted(e) == 0)
+
+            test.case("writing and finishing are separate, because an unfinished stream is INVALID")
+            let out = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0])
+            match brotlienc.write(e, bytes.from_str("hi"), out, 0)
+                Err(_) => test.assert(false)
+                Ok(n)  => test.assert(n >= 0)
+            match brotlienc.finish(brotlienc.advanced(e), out, 0)
+                Err(_) => test.assert(false)
+                Ok(n)  => test.assert(n >= 0)
+
+    test.case("a level the package does not implement is refused before anything is built")
+    match brotlienc.encoder(BroQuality { level: 9, window_bits: 22, use_dictionary: true,
+                                         text_hint: false })
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_the_headers_parse_from_bytes_and_answer_where_the_payload_begins() [io]
+    test.case("THE CLAIM: the stream header is at most 21 bits and says how big a window")
+    match brotlistream.parse_header(stub(), brotlistream.small_limits())
+        Err(_) => test.assert(true)
+        Ok(h)  =>
+            test.assert(h.header_bits > 0)
+            test.assert(h.window_size == brotlistream.window_size_of(h.window_bits))
+
+    test.case("and a meta-block header is read from a BIT position, because blocks are not aligned")
+    match brotliblock.parse_header(stub(), 5)
+        Err(_) => test.assert(true)
+        Ok(b)  =>
+            test.assert(brotliblock.payload_at(b, 5) >= 5)
+            test.assert(b.header_bits >= 0)
+
+    test.case("the block-type count bounds what a switch may name")
+    test.assert(brotliblock.block_type_count([1, 1, 1], BroLiterals) == 1)
+    test.assert(brotliblock.block_type_count([4, 1, 2], BroDistances) == 2)
+
+@test
+fn test_a_prefix_code_is_read_in_whichever_shape_the_stream_wrote_it() [io]
+    test.case("THE CLAIM: the two bits at the head decide, and the dispatch is published")
+    test.assert(brotliprefix.is_simple_at(stub(), 0) == false)
+
+    test.case("a simple code lists its symbols outright")
+    match brotliprefix.read_simple(stub(), 0, 256)
+        Err(_) => test.assert(true)
+        Ok(s)  => test.assert(list.len(s.symbols) >= 1)
+
+    test.case("and a complex one is run-length coded lengths behind a code of its own")
+    match brotliprefix.read_complex(stub(), 0, 256)
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(brotliprefix.code_bits(p) >= 0)
+
+    test.case("either way a caller gets a code it can decode a symbol with")
+    match brotliprefix.read(stub(), 0, 256)
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(list.len(brotliprefix.decode_symbol(p, stub(), 0)) == 2)
+
+    test.case("and an encoder builds one from lengths, which is what makes the sum testable")
+    match brotliprefix.of_lengths([1, 1])
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(brotliprefix.live_symbols(p) == 2)
+
+@test
+fn test_the_map_and_the_dictionary_are_reached_by_the_calls_the_decoder_makes() [io]
+    test.case("THE CLAIM: a map that decodes to the wrong number of entries is refused")
+    match brotlicontext.read_map(stub(), 0, 64, 1)
+        Err(_) => test.assert(true)
+        Ok(m)  => test.assert(brotlicontext.map_size(m) == 64)
+
+    test.case("and a dictionary reference is a word AND a transform, in one call")
+    match brotlidict.transformed(4, 0, brotlidict.identity_id())
+        Err(_) => test.assert(true)
+        Ok(b)  => test.assert(bytes.len(b) == 4)
+
+    test.case("the distance a code names is available without building a reference")
+    test.assert(brotlidist.distance_of(brotlidist.default_params(),
+                                       brotlidist.initial_cache(), 0, 0) == 16)

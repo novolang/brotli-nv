@@ -1,0 +1,200 @@
+// brotliprefix.nv — prefix codes, in the two shapes the format writes
+// them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO REPRESENTATIONS, AND THE SMALL ONE IS NOT AN OPTIMISATION.  A
+// Brotli prefix code is either SIMPLE — one to four symbols listed
+// outright, with the lengths implied by the count — or COMPLEX, a
+// run-length-coded list of code lengths written with a prefix code of
+// its own.  The simple form exists because a meta-block declares three
+// codes and a context map on top, and a code for an alphabet with two
+// live symbols would otherwise cost more than the data.  A decoder
+// that only implemented the complex form decodes almost nothing.
+//
+// THE FOUR-SYMBOL SIMPLE CODE HAS A TIE-BREAK BIT, which is the detail
+// every implementation meets once: with four symbols the lengths can
+// be 2/2/2/2 or 1/2/3/3, and one bit says which.  `BroSimple.tree_select`
+// is that bit, named rather than folded away, because a decoder that
+// ignored it builds the wrong tree for a code that is otherwise valid.
+//
+// AND A COMPLETE CODE IS CHECKED, BY THE KRAFT SUM.  A code whose
+// lengths leave a hole is a stream that can ask for a symbol that does
+// not exist; one that overflows is a stream whose tree cannot be
+// built.  `BroBadPrefixCode` carries the sum scaled to 32768 so a
+// caller can see which way it failed — the one number that
+// distinguishes an under-full code from an over-full one.
+//
+// ONE EXCEPTION, FROM THE SPECIFICATION: a code with exactly ONE
+// symbol of length 0 is legal and is not complete.  It means that
+// symbol always, consuming no bits.  `is_single_symbol` is how a
+// caller tells that from a hole.
+
+use brotlierror
+
+// A prefix code, ready to decode with.
+//
+// Holds the canonical lengths rather than a tree: a table-driven
+// decode reads the lengths once and builds whatever it needs, and a
+// tree structure crossing the interface would fix a representation the
+// implementation should still be free to choose.
+pub struct BroPrefix
+    // One code length per symbol, 0 for a symbol the code does not
+    // carry.
+    lengths: [Int]
+    // How many symbols have a non-zero length.
+    live: Int
+    // The single symbol this code always answers, or -1 when it is an
+    // ordinary code.  See `is_single_symbol`.
+    single: Int
+
+// A simple prefix code as the stream writes it, before it becomes a
+// `BroPrefix`.
+//
+// Published as its own value because a tool reading a stream wants to
+// report which codes were simple — it is the clearest signal of how an
+// encoder chose to spend bits — and because the tie-break bit needs
+// somewhere to live where it is visible.
+pub struct BroSimple
+    // One to four symbols, in the order the stream wrote them.
+    symbols: [Int]
+    // The tie-break bit, meaningful only with four symbols: false for
+    // 2/2/2/2, true for 1/2/3/3.
+    tree_select: Bool
+
+// The largest code length the format allows: 15.
+pub fn max_code_length() -> Int []
+    todo("brotli-nv.brotliprefix.max_code_length")
+
+// The complete Kraft sum, scaled: 32768.
+//
+// Published because it is the number `BroBadPrefixCode` is compared
+// against, and a caller reading that fault should not have to know
+// that `1 << 15` is the scale.
+pub fn complete_sum() -> Int []
+    todo("brotli-nv.brotliprefix.complete_sum")
+
+// How many symbols a simple code may list, as a pair: 1 and 4.
+pub fn simple_count_range() -> [Int] []
+    todo("brotli-nv.brotliprefix.simple_count_range")
+
+// ── Reading a code ───────────────────────────────────────────────────
+
+// Whether the two bits at a position introduce a simple code.
+//
+// The dispatch at the head of every code in the format, published so a
+// caller driving its own reader does not re-derive it.
+pub fn is_simple_at(src: Bytes, at_bit: Int) -> Bool []
+    todo("brotli-nv.brotliprefix.is_simple_at")
+
+// Read a simple code.
+//
+// `BroBadSimpleCode` when the count is outside 1 to 4 or a symbol
+// repeats — the second of which is a stream that would build a tree
+// with two leaves for one symbol, and which a decoder that only
+// checked the count would accept.
+pub fn read_simple(src: Bytes, at_bit: Int,
+                   alphabet_size: Int) -> Result<BroSimple, brotlierror.BroFault> []
+    todo("brotli-nv.brotliprefix.read_simple")
+
+// A simple code turned into a prefix code.
+//
+// Where the tie-break bit is spent.  Separate from `read_simple` so
+// that a caller reporting on a stream can see the simple form as the
+// stream wrote it and the code it became.
+pub fn prefix_of_simple(s: BroSimple, alphabet_size: Int) -> BroPrefix []
+    todo("brotli-nv.brotliprefix.prefix_of_simple")
+
+// Read a complex code: the code-length code, then the lengths it
+// encodes.
+//
+// `BroBadPrefixCode` when the resulting lengths are not a complete
+// code.
+pub fn read_complex(src: Bytes, at_bit: Int,
+                    alphabet_size: Int) -> Result<BroPrefix, brotlierror.BroFault> []
+    todo("brotli-nv.brotliprefix.read_complex")
+
+// Read whichever shape is there.
+//
+// The call a decoder makes; the two above are for a caller that wants
+// to see which it was.
+pub fn read(src: Bytes, at_bit: Int,
+            alphabet_size: Int) -> Result<BroPrefix, brotlierror.BroFault> []
+    todo("brotli-nv.brotliprefix.read")
+
+// How many BITS a code occupied, so the caller can advance.
+pub fn code_bits(p: BroPrefix) -> Int []
+    todo("brotli-nv.brotliprefix.code_bits")
+
+// ── The code-length alphabet ─────────────────────────────────────────
+
+// The order the code-length code's own lengths are written in.
+//
+// Eighteen symbols in a fixed, non-monotonic order — 1, 2, 3, 4, 0, 5,
+// 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15 — chosen so the common
+// lengths come first and the list can stop early.  Published as data
+// because it is a table a reader has to have exactly right and cannot
+// derive, and because a test can compare it against RFC 7932 § 3.5.
+pub fn code_length_order() -> [Int] []
+    todo("brotli-nv.brotliprefix.code_length_order")
+
+// The two repeat symbols of the code-length alphabet: 16 and 17.
+//
+// 16 repeats the previous NON-ZERO length, 17 repeats a run of zeroes,
+// and both carry extra bits whose count grows as the run continues —
+// so two consecutive 16s do not mean the same as one 16 with a longer
+// run.  The pair is published because that accumulation is the part a
+// hand-written decoder gets wrong.
+pub fn repeat_symbols() -> [Int] []
+    todo("brotli-nv.brotliprefix.repeat_symbols")
+
+// How many extra bits a repeat symbol carries: 2 for 16, 3 for 17.
+pub fn repeat_extra_bits(symbol: Int) -> Int []
+    todo("brotli-nv.brotliprefix.repeat_extra_bits")
+
+// ── Reading a code, and checking one ─────────────────────────────────
+
+// The symbol a code answers for the bits at a position, and how many
+// bits it consumed, as a pair.
+//
+// `[symbol, bits]`.  A pair rather than a struct because it is
+// returned once per symbol of the whole stream and a boxed value there
+// would be the decode's dominant cost.
+pub fn decode_symbol(p: BroPrefix, src: Bytes, at_bit: Int) -> [Int] []
+    todo("brotli-nv.brotliprefix.decode_symbol")
+
+// The Kraft sum of a code's lengths, scaled to 32768.
+//
+// 32768 exactly is complete; less leaves a hole; more overflows.
+// Published so a caller can check a code it built itself — an encoder
+// does exactly that before it writes one.
+pub fn kraft_sum(lengths: [Int]) -> Int []
+    todo("brotli-nv.brotliprefix.kraft_sum")
+
+// Whether the lengths form a complete prefix code.
+pub fn is_complete(lengths: [Int]) -> Bool []
+    todo("brotli-nv.brotliprefix.is_complete")
+
+// Whether the code always answers one symbol, consuming no bits.
+//
+// THE EXCEPTION TO COMPLETENESS.  A code with exactly one symbol is
+// legal and its Kraft sum is not 32768; a decoder that required
+// completeness rejects it, and a caller that saw only "incomplete"
+// could not tell the two apart.
+pub fn is_single_symbol(p: BroPrefix) -> Bool []
+    todo("brotli-nv.brotliprefix.is_single_symbol")
+
+// How many symbols the code can answer.
+pub fn live_symbols(p: BroPrefix) -> Int []
+    todo("brotli-nv.brotliprefix.live_symbols")
+
+// The code's lengths, for a caller re-encoding or reporting.
+pub fn lengths_of(p: BroPrefix) -> [Int] []
+    todo("brotli-nv.brotliprefix.lengths_of")
+
+// A prefix code built from lengths the caller has.
+//
+// The encoder's half, and what makes `kraft_sum` testable against a
+// code this package produced rather than only against one it read.
+pub fn of_lengths(lengths: [Int]) -> Result<BroPrefix, brotlierror.BroFault> []
+    todo("brotli-nv.brotliprefix.of_lengths")

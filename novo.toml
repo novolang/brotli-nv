@@ -1,0 +1,59 @@
+[package]
+name        = "brotli-nv"
+version     = "0.0.1"
+description = "RFC 7932 Brotli, decoder first: the stream header and its window bits, meta-blocks, simple and complex prefix codes, context modelling for literals and distances, and the STATIC DICTIONARY with its word transforms as data this package owns.  The load-bearing call is `brotlidist.resolve`: a distance past the current output position is not an error but a dictionary reference, which is what a third of real HTTP responses contain.  Feed-and-drain over a window the caller sizes; the encoder declared for quality 0 to 4.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A compressed stream is bytes somebody else read — an HTTP
+# body, a file, a cache entry — and turning it back into bytes is
+# arithmetic over a window the CALLER sized.  The decoder is a
+# feed-and-drain state machine, which is how a `core` package takes a
+# stream it must not accumulate (`docs/publishing.md` § How a `core`
+# package takes bytes from its host, first shape).
+#
+# The window is the one number that could have made this `host`: a
+# stream header may demand 16 MiB, and a package that allocated on a
+# number out of a file would be a denial of service with a decoder on
+# the front.  So the number crosses the interface before anything is
+# allocated and the caller decides.
+layer       = "core"
+
+category    = "compression"
+
+tags        = ["brotli", "rfc7932", "compression", "decompression", "content-encoding", "http", "sans-io"]
+repository  = "https://github.com/novolang/brotli-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A distance past the end of the output is not a mistake"
+
+[dependencies]
+# bitstream-nv, for the LSB-first bit reader every field in the format
+# is read through.
+#
+# The same dependency zstd-nv takes for the same reason, and the same
+# argument: a bit accumulator is four integers and a shift, every codec
+# on the grid needs one, and three of them would be three places for
+# the same off-by-one to live.  Brotli is LSB-first throughout —
+# `BitsLsbFirst` — with no backward reads, so unlike zstd-nv this
+# package needs nothing the published surface does not have.
+bitstream-nv = "^0.0.1"
+
+# NOT http-codec-nv, and the absence is deliberate rather than an
+# oversight.  `Content-Encoding: br` is the consumer that makes this
+# package worth writing, and the dependency points the other way: a
+# codec does not depend on the protocol that carries it, or every
+# program that decompresses a file would download an HTTP parser.
+# `brotlistream.content_encoding_token` names the token so the two
+# agree about the spelling without either depending on the other.

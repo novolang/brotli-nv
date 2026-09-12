@@ -1,0 +1,238 @@
+// brotlienc.nv — the encoder, declared honestly: quality 0 to 4, a
+// greedy matcher, and no claim to be the reference compressor.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SCOPE IS NARROWER THAN THE DECODER'S AND IS NAMED RATHER THAN
+// DISCOVERED.  The reference implementation has eleven quality levels;
+// the top of that range is a block-splitting, context-clustering,
+// Zopfli-style search that takes seconds per megabyte and is a
+// research project of its own.  What this package declares is 0 to 4:
+//
+//   0 — literals and the cheapest matches, one pass, fixed codes;
+//   1 — a small hash chain, still one pass;
+//   2 to 4 — a longer hash chain, a lazy match at 3 and 4, and
+//        prefix codes built from the block's own histogram.
+//
+// All five are GREEDY: the matcher takes the best match it finds at
+// each position, with a one-position look-ahead above quality 2, and
+// never searches for a globally better parse.  A stream from quality 4
+// here is a valid Brotli stream that any decoder reads; it is simply
+// larger than one the reference compressor at quality 11 would
+// produce, and the README says by roughly how much rather than leaving
+// a reader to find out.
+//
+// THE DICTIONARY IS USED, WHICH IS THE ONE PLACE THE ENCODER IS NOT
+// CHEAP.  A reference into the static dictionary is often the single
+// biggest win on a small HTML response — it is how the first hundred
+// bytes of a page cost almost nothing — so `BroQuality.use_dictionary`
+// is on by default, and a caller that wants the matcher's cost down
+// can turn it off and see the size grow.
+//
+// WHAT IS NOT DECLARED AT ALL: block splitting, context clustering,
+// custom dictionaries, and any quality above 4.  Each is a named
+// absence rather than a stub, because an interface that declared
+// `quality: 11` and produced quality-4 output would be a lie the
+// compiler cannot catch.
+
+use brotlierror
+use brotlistream
+
+// How hard the encoder works.
+//
+// `@value`: four small numbers passed into every compress, never a
+// `Result` payload.
+pub @value
+struct BroQuality
+    // 0 to 4.  Outside that is `BroBadQuality`.
+    level: Int
+    // `WBITS` for the stream this produces, 10 to 24.  The encoder's
+    // window, which bounds how far back a match may reach and which a
+    // decoder will have to allocate — so an encoder that always asked
+    // for the maximum would be making every decoder pay for a window
+    // the data never used.
+    window_bits: Int
+    // Whether to search the static dictionary for matches.
+    //
+    // On by default.  It is the biggest single win on small HTML and
+    // the most expensive part of the match search, which is why it is
+    // a field rather than a consequence of the level.
+    use_dictionary: Bool
+    // Whether the input is known to be text, which chooses the UTF-8
+    // context mode over `BroLsb6`.
+    //
+    // A hint the encoder cannot reliably infer from a first chunk of a
+    // stream, and one that changes the literal coding for the whole
+    // meta-block.
+    text_hint: Bool
+
+// The fastest setting: level 0, a 4 MiB window, dictionary on.
+pub fn fastest() -> BroQuality []
+    todo("brotli-nv.brotlienc.fastest")
+
+// The best this package declares: level 4, a 4 MiB window, dictionary
+// on.
+//
+// NOT the best Brotli can do, and the name says so — `best` would be
+// a claim about the format rather than about this encoder.
+pub fn best_declared() -> BroQuality []
+    todo("brotli-nv.brotlienc.best_declared")
+
+// The levels this package implements, as a pair: 0 and 4.
+//
+// Published so a caller mapping from another library's 0-to-11 scale
+// can clamp explicitly, and so `BroBadQuality` has a range to name.
+pub fn quality_range() -> [Int] []
+    todo("brotli-nv.brotlienc.quality_range")
+
+// Whether a level is one this package implements.
+pub fn supports_quality(level: Int) -> Bool []
+    todo("brotli-nv.brotlienc.supports_quality")
+
+// ── Encoding ─────────────────────────────────────────────────────────
+
+// An encode in progress.
+pub struct BroEncoder
+    // The window of input the matcher can reach back into.
+    window: Bytes
+    // How many bytes of it are live.
+    window_len: Int
+    // How many bytes of input have been consumed.
+    consumed: Int
+    // How many bytes of output have been produced.
+    emitted: Int
+    // The settings, FLATTENED rather than held as a `BroQuality`.
+    //
+    // SPEC § 14.5 keeps an unboxed struct out of a boxed struct's
+    // field, and `BroQuality` is `@value` because it is a parameter to
+    // five calls and is built once per stream.  So the owner carries
+    // the four numbers and `quality_of` rebuilds the value — which is
+    // the shape `docs/publishing.md` describes for a settings value
+    // that is both passed and stored, and which the README names as a
+    // place the language decided the layout.
+    quality_level: Int
+    // `WBITS` for the stream being produced.
+    quality_window_bits: Int
+    // Whether the static dictionary is being searched.
+    quality_use_dictionary: Bool
+    // Whether the input was declared to be text.
+    quality_text_hint: Bool
+    // The internal state, as an `Int` for the same reason the
+    // decoder's is.
+    state: Int
+
+// Start an encode.
+//
+// `BroBadQuality` when the level is outside `quality_range`;
+// `BroBadWindowBits` when the window bits are outside 10 to 24.
+pub fn encoder(q: BroQuality) -> Result<BroEncoder, brotlierror.BroFault> []
+    todo("brotli-nv.brotlienc.encoder")
+
+// Feed input, writing whatever compressed bytes are ready into the
+// caller's buffer.
+//
+// The mirror of the decoder's `step`, and the caller's buffer for the
+// same reason: the encoder's memory is a function of its WINDOW and
+// not of how much the caller has pushed through it.  Answers how many
+// bytes were written.
+pub fn write(e: BroEncoder, input: Bytes, out: Bytes,
+             at: Int) -> Result<Int, brotlierror.BroFault> []
+    todo("brotli-nv.brotlienc.write")
+
+// The settings an encoder was built with.
+//
+// Rebuilds the `@value` from the four fields the encoder carries flat.
+// Published so a caller that has an encoder and wants to report or
+// reuse its settings does not have to read four fields and hope it got
+// them in the right order.
+pub fn quality_of(e: BroEncoder) -> BroQuality []
+    todo("brotli-nv.brotlienc.quality_of")
+
+// The encoder after a `write`.
+pub fn advanced(e: BroEncoder) -> BroEncoder []
+    todo("brotli-nv.brotlienc.advanced")
+
+// Close the stream: emit the last meta-block and the end marker.
+//
+// A stream that is never finished is not a short stream, it is an
+// INVALID one — the last-block flag is what tells a decoder to stop,
+// and without it the decoder waits for a meta-block that never comes.
+// Its own call so the mistake is a missing line rather than a subtle
+// flag.
+pub fn finish(e: BroEncoder, out: Bytes, at: Int) -> Result<Int, brotlierror.BroFault> []
+    todo("brotli-nv.brotlienc.finish")
+
+// How many bytes the encoder has written.
+pub fn emitted(e: BroEncoder) -> Int []
+    todo("brotli-nv.brotlienc.emitted")
+
+// ── For a caller that has the whole thing ────────────────────────────
+
+// Compress a buffer the caller already holds.
+pub fn compress(src: Bytes, q: BroQuality) -> Result<Bytes, brotlierror.BroFault> []
+    todo("brotli-nv.brotlienc.compress")
+
+// The largest output `compress` can produce for an input of this size.
+//
+// Brotli's worst case is larger than its input — a stored meta-block
+// has a header, and a stream of them has one each — so a caller
+// sizing a buffer from the input length under-allocates.  The bound is
+// published rather than left to be discovered by a truncated stream.
+pub fn max_compressed_size(input_len: Int) -> Int []
+    todo("brotli-nv.brotlienc.max_compressed_size")
+
+// A stream that stores its input verbatim.
+//
+// Every byte in uncompressed meta-blocks, with no matching and no
+// prefix codes.  The floor of what an encoder can do, and worth
+// publishing for two reasons: it is what quality 0 falls back to on
+// incompressible data, and it is what a test round-trips against
+// before any matcher exists.
+pub fn store(src: Bytes, window_bits: Int) -> Result<Bytes, brotlierror.BroFault> []
+    todo("brotli-nv.brotlienc.store")
+
+// ── What this encoder is not ─────────────────────────────────────────
+
+// The highest quality the FORMAT allows: 11.
+//
+// Published beside `quality_range` so the gap is a number a caller can
+// see rather than a paragraph it has to find.  The four levels above 4
+// are block splitting and context clustering, which are named absences
+// in the README and a row of their own.
+pub fn format_max_quality() -> Int []
+    todo("brotli-nv.brotlienc.format_max_quality")
+
+// Whether the encoder splits a meta-block by content: false.
+//
+// Block splitting is what lets one meta-block use different literal
+// codes for its HTML and its embedded base64, and it is most of the
+// difference between quality 4 and quality 11.  A function rather than
+// a sentence, because a caller comparing output sizes against another
+// library deserves to be able to assert which feature is missing.
+pub fn splits_blocks() -> Bool []
+    todo("brotli-nv.brotlienc.splits_blocks")
+
+// Whether the encoder can be given a custom dictionary: false.
+//
+// RFC 7932's shared-dictionary extension, and the `Use-As-Dictionary`
+// header the web is now shipping, are a different value — the caller's
+// own bytes prepended to the window rather than indexed by length —
+// and they are a row of their own rather than half-built here.
+pub fn supports_custom_dictionary() -> Bool []
+    todo("brotli-nv.brotlienc.supports_custom_dictionary")
+
+// The window bits this encoder would choose for an input of this size.
+//
+// The smallest window that can reach every byte of the input, clamped
+// to 10 to 24.  Published because it is the courtesy an encoder owes a
+// decoder: a 2 KB response compressed with a 16 MiB window makes every
+// reader allocate 16 MiB to read 2 KB.
+pub fn window_bits_for(input_len: Int) -> Int []
+    todo("brotli-nv.brotlienc.window_bits_for")
+
+// The limits a decoder would need to read what this quality produces.
+//
+// The other half of the courtesy above, as a value a producer can send
+// to a consumer — or a test can compare a round trip against.
+pub fn limits_for(q: BroQuality) -> brotlistream.BroLimits []
+    todo("brotli-nv.brotlienc.limits_for")

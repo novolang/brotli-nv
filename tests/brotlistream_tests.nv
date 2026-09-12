@@ -1,0 +1,156 @@
+// brotlistream_tests.nv — the window is the caller's budget, and the
+// dictionary is the size it is.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
+//
+// THE TWO ASSERTIONS THIS SUITE EXISTS FOR:
+//
+//   a header that asks for a window the caller did not budget for is
+//   refused with BOTH numbers, before anything is allocated — because
+//   a four-byte response body can ask for a gigabyte;
+//
+//   and the static dictionary is 122,784 bytes that every consumer
+//   carries.  A number in a README is not something a build can read,
+//   so it is a function and this asserts it.
+//
+// THE VECTORS are RFC 7932 § 9.1 (the window formula), § 8 (the
+// dictionary's size and shape) and the one-byte empty stream.
+
+use std.test
+use std.list
+use std.bytes
+use brotlistream
+use brotlidict
+use brotlidec
+use brotlierror
+
+@test
+fn test_the_window_size_is_sixteen_bytes_short_of_a_power_of_two() [io]
+    test.case("THE CLAIM: (1 << bits) - 16, and the sixteen is the part readers miss")
+    test.assert(brotlistream.window_size_of(10) == 1008)
+    test.assert(brotlistream.window_size_of(16) == 65520)
+    test.assert(brotlistream.window_size_of(24) == 16777200)
+
+    test.case("so a decoder that computed 1 << bits accepts streams the format forbids")
+    test.assert(brotlistream.window_size_of(16) != 65536)
+
+    test.case("the base format runs 10 to 24")
+    let r = brotlistream.window_bits_range()
+    test.assert(r[0] == 10)
+    test.assert(r[1] == 24)
+
+    test.case("and the large-window EXTENSION goes to 30, which is not RFC 7932")
+    test.assert(brotlistream.large_window_max_bits() == 30)
+
+@test
+fn test_a_window_past_the_budget_is_refused_before_anything_is_allocated() [io]
+    let small = brotlistream.small_limits()
+    let big = brotlistream.default_limits()
+
+    test.case("THE CLAIM: a four-byte body can ask for a gigabyte, so the caller decides")
+    test.assert(small.max_window < big.max_window)
+    test.assert(small.max_output > 0)
+
+    test.case("the default accepts every conformant stream and nothing more")
+    test.assert(big.max_window >= brotlistream.window_size_of(24))
+
+    test.case("and a header past the budget carries BOTH numbers")
+    let h = BroHeader { window_bits: 24, window_size: 16777200, large_window: false,
+                        header_bits: 5 }
+    test.assert(brotlistream.fits(h, big))
+    test.assert(brotlistream.fits(h, small) == false)
+    test.assert(brotlierror.is_budget(BroWindowTooLarge(16777200, 65536)))
+
+    test.case("which is a refusal rather than an allocator failure with a stranger's number")
+    test.assert(brotlierror.fault_at(BroWindowTooLarge(16777200, 65536)) == 0 - 1)
+
+@test
+fn test_there_is_no_magic_number_and_the_heuristic_says_so_in_its_name() [io]
+    test.case("THE CLAIM: the first bits ARE the window field, so nothing identifies a stream")
+    test.assert(brotlistream.looks_like_brotli(bytes.from_byte_list([31, 139, 8])) == false)
+    test.assert(brotlistream.looks_like_brotli(bytes.from_str("PK\u{3}\u{4}")) == false)
+
+    test.case("the real answer is the Content-Encoding header, whose token is published here")
+    test.assert(brotlistream.content_encoding_token() == "br")
+
+    test.case("which is how http-codec-nv and this package agree without depending on each other")
+    test.assert(brotlistream.content_encoding_token() != "gzip")
+
+@test
+fn test_the_empty_stream_is_one_byte_and_the_format_has_no_checksum() [io]
+    test.case("THE CLAIM: an encoder must emit it and a decoder must accept it")
+    test.assert(bytes.len(brotlistream.empty_stream()) == 1)
+
+    test.case("and there is NO integrity check of any kind, unlike gzip's CRC32")
+    test.assert(brotlidec.has_checksum() == false)
+
+    test.case("so a structurally valid stream is accepted whatever it decodes to")
+    match brotlidec.decompress(brotlistream.empty_stream(), brotlistream.small_limits())
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(bytes.len(b) == 0)
+
+@test
+fn test_the_dictionary_is_the_size_it_is_and_a_build_can_read_the_number() [io]
+    test.case("THE CLAIM: 122,784 bytes in the binary of every consumer")
+    test.assert(brotlidict.dictionary_bytes() == 122784)
+
+    test.case("holding 13,504 words of lengths 4 to 24")
+    test.assert(brotlidict.word_count() == 13504)
+    test.assert(brotlidict.length_range()[0] == 4)
+    test.assert(brotlidict.length_range()[1] == 24)
+
+    test.case("and 121 transforms, without which the words are half the story")
+    test.assert(brotlidict.transform_count() == 121)
+
+    test.case("a length outside the range holds no words at all")
+    test.assert(brotlidict.words_of_length(3) == 0)
+    test.assert(brotlidict.words_of_length(25) == 0)
+    test.assert(brotlidict.words_of_length(4) > 0)
+
+@test
+fn test_a_transform_is_a_prefix_an_operation_and_a_suffix() [io]
+    test.case("THE CLAIM: five kinds and 121 entries, not 121 variants")
+    match brotlidict.transform(brotlidict.identity_id())
+        Err(_) => test.assert(false)
+        Ok(t)  =>
+            test.assert(t.kind == BroIdentity)
+            test.assert(bytes.len(t.prefix) == 0)
+            test.assert(bytes.len(t.suffix) == 0)
+            test.assert(t.omit == 0)
+
+    test.case("and the identity is transform 0, which is the encoder's cheapest reference")
+    test.assert(brotlidict.identity_id() == 0)
+    test.assert(brotlidict.transform_changes_word(0) == false)
+
+    test.case("a transform past the table is refused by name")
+    match brotlidict.transform(200)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_the_transformed_length_is_not_the_word_length() [io]
+    test.case("THE CLAIM: a caller sizing from the copy length alone under-allocates")
+    test.assert(brotlidict.transformed_len(6, brotlidict.identity_id()) == 6)
+    test.assert(brotlidict.max_transformed_len(6) > 6)
+
+    test.case("because the two transforms that make HTML compress both add bytes")
+    let common = brotlidict.common_html_transforms()
+    test.assert(list.len(common) == 2)
+    test.assert(brotlidict.transformed_len(6, common[0]) > 6)
+    test.assert(brotlidict.transformed_len(6, common[1]) > 6)
+
+@test
+fn test_a_word_out_of_range_is_refused_before_the_data_is_touched() [io]
+    test.case("THE CLAIM: the bound check is what stops a corrupt stream reading past the end")
+    test.assert(brotlidict.word_exists(4, 0))
+    test.assert(brotlidict.word_exists(3, 0) == false)
+    test.assert(brotlidict.word_exists(4, 999999) == false)
+
+    match brotlidict.word(3, 0)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(brotlierror.is_budget(e) == false)
+
+    test.case("and the offset table is published, so a caller can serve the data from flash")
+    test.assert(brotlidict.offset_of_length(4) == 0)
+    test.assert(brotlidict.offset_of_length(5) > 0)

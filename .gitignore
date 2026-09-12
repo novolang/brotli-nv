@@ -1,0 +1,19 @@
+# Build outputs.
+_novo/
+
+# The generated API page.  `novo doc` writes it here so you can read
+# what the registry will serve; the registry gets its own copy,
+# uploaded beside the archive by `novo pkg publish`.  It is generated
+# from the sources, so committing it would be committing a second
+# original.
+APIDOC.md
+
+# The built package binary — `novo pkg build` names it after the
+# package.  This package is a LIBRARY and builds none; the line is here
+# for when it grows a `main` and it does.
+/brotli-nv
+
+# The resolved dependency graph.  A library pins nothing for its
+# consumers — a consumer resolves its own — so the lock is a local
+# build artefact rather than a fact about the release.
+novo.lock

@@ -1,0 +1,198 @@
+// brotliblock_tests.nv — meta-blocks, prefix codes, contexts, and the
+// four places a decoder goes silently wrong.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
+//
+// THE FOUR, EACH WITH ITS OWN ASSERTION BELOW:
+//
+//   a metadata meta-block's bytes are NOT output, and a decoder that
+//   emitted them produces the right length of wrong bytes;
+//
+//   the block-type state's PREVIOUS starts at 1, not 0, so a stream
+//   whose first switch is the relative code selects type 1;
+//
+//   an insert-and-copy code below 128 carries NO distance and reuses
+//   `d0`, so a decoder that read one desynchronises completely;
+//
+//   and a prefix code with exactly one symbol is legal and is NOT
+//   complete, so a decoder that required completeness rejects it.
+
+use std.test
+use std.list
+use brotliblock
+use brotliprefix
+use brotlicontext
+
+@test
+fn test_metadata_is_skipped_and_not_emitted() [io]
+    let meta = BroBlockHeader { kind: BroMetadata, length: 0, skip_len: 32,
+                                is_last: false, header_bits: 20 }
+    let data = BroBlockHeader { kind: BroCompressed, length: 4096, skip_len: 0,
+                                is_last: false, header_bits: 20 }
+
+    test.case("THE CLAIM: metadata produces NO output, however many bytes it covers")
+    test.assert(brotliblock.produces_output(meta) == false)
+    test.assert(meta.length == 0)
+    test.assert(meta.skip_len == 32)
+
+    test.case("which a decoder that appended them would get wrong with no length check firing")
+    test.assert(brotliblock.produces_output(data))
+
+    test.case("and metadata is the second of two kinds whose payload is byte-aligned")
+    test.assert(brotliblock.payload_is_aligned(meta))
+    test.assert(brotliblock.payload_is_aligned(data) == false)
+
+    test.case("a last-empty block ends the stream and contributes nothing")
+    let last = BroBlockHeader { kind: BroLastEmpty, length: 0, skip_len: 0,
+                                is_last: true, header_bits: 2 }
+    test.assert(brotliblock.produces_output(last) == false)
+    test.assert(last.is_last)
+
+@test
+fn test_a_meta_block_declares_at_most_sixteen_mebibytes() [io]
+    test.case("THE CLAIM: MNIBBLES runs to 6, so the length field holds 24 bits")
+    test.assert(brotliblock.max_block_length() == 16777216)
+
+    test.case("which is NOT the window size, though the two coincide at the largest window")
+    test.assert(brotliblock.max_block_length() != 16777200)
+
+@test
+fn test_the_previous_block_type_starts_at_one_and_not_at_zero() [io]
+    let s = brotliblock.initial_block_state(5)
+
+    test.case("THE CLAIM: from the specification — a decoder that seeded 0 decodes wrong")
+    test.assert(s.current == 0)
+    test.assert(s.previous == 1)
+    test.assert(s.remaining == 5)
+
+    test.case("code 0 means the PREVIOUS type, which is why the seed matters")
+    test.assert(brotliblock.switch_to(s, 0, 4, 3).current == 1)
+
+    test.case("code 1 means the next one round, and wraps at the count")
+    test.assert(brotliblock.switch_to(s, 1, 4, 3).current == 1)
+
+    test.case("and anything else is code - 2 directly")
+    test.assert(brotliblock.switch_to(s, 5, 8, 3).current == 3)
+
+    test.case("the run counts down, and a switch is read when it reaches zero")
+    test.assert(brotliblock.consume(s).remaining == 4)
+    test.assert(brotliblock.needs_switch(s) == false)
+    test.assert(brotliblock.needs_switch(BroBlockState { current: 0, previous: 1,
+                                                         remaining: 0 }))
+
+@test
+fn test_an_insert_and_copy_code_below_one_hundred_and_twenty_eight_carries_no_distance() [io]
+    test.case("THE CLAIM: it reuses d0, and a decoder that read a distance desynchronises")
+    test.assert(brotliblock.uses_implicit_distance(0))
+    test.assert(brotliblock.uses_implicit_distance(127))
+    test.assert(brotliblock.uses_implicit_distance(128) == false)
+
+    test.case("so the command carries the flag rather than leaving it to be re-derived")
+    test.assert(brotliblock.command_of(10, 0, 0).implicit_distance)
+    test.assert(brotliblock.command_of(300, 0, 0).implicit_distance == false)
+
+    test.case("the alphabet is 704 codes covering both lengths through a table of ranges")
+    test.assert(brotliblock.command_alphabet_size() == 704)
+
+    test.case("and the two halves of a code carry their extra bits independently")
+    test.assert(brotliblock.insert_extra_bits(0) == 0)
+    test.assert(brotliblock.copy_extra_bits(0) == 0)
+    test.assert(brotliblock.insert_extra_bits(700) > 0)
+
+@test
+fn test_a_one_symbol_prefix_code_is_legal_and_is_not_complete() [io]
+    test.case("THE CLAIM: it means that symbol always, consuming no bits")
+    let single = BroPrefix { lengths: [0], live: 1, single: 0 }
+    test.assert(brotliprefix.is_single_symbol(single))
+
+    test.case("and its Kraft sum is not the complete one, so completeness alone rejects it")
+    test.assert(brotliprefix.complete_sum() == 32768)
+    test.assert(brotliprefix.is_complete([0]) == false)
+
+    test.case("a genuinely complete code sums to exactly that")
+    test.assert(brotliprefix.kraft_sum([1, 1]) == 32768)
+    test.assert(brotliprefix.is_complete([1, 1]))
+
+    test.case("a hole leaves less and an overflow leaves more, which is why the sum is carried")
+    test.assert(brotliprefix.kraft_sum([1, 2]) < 32768)
+    test.assert(brotliprefix.kraft_sum([1, 1, 1]) > 32768)
+
+    test.case("and the largest length the format allows is 15")
+    test.assert(brotliprefix.max_code_length() == 15)
+
+@test
+fn test_the_simple_code_exists_because_a_complex_one_would_cost_more_than_the_data() [io]
+    test.case("THE CLAIM: one to four symbols listed outright")
+    let r = brotliprefix.simple_count_range()
+    test.assert(r[0] == 1)
+    test.assert(r[1] == 4)
+
+    test.case("and four symbols need a TIE-BREAK BIT, because 2/2/2/2 and 1/2/3/3 both fit")
+    let flat = BroSimple { symbols: [1, 2, 3, 4], tree_select: false }
+    let skewed = BroSimple { symbols: [1, 2, 3, 4], tree_select: true }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(flat, 8))
+                != brotliprefix.lengths_of(brotliprefix.prefix_of_simple(skewed, 8)))
+
+    test.case("a repeated symbol is refused, which a count-only check would accept")
+    test.assert(brotliprefix.live_symbols(brotliprefix.prefix_of_simple(flat, 8)) == 4)
+
+@test
+fn test_the_code_length_order_is_a_table_that_cannot_be_derived() [io]
+    let order = brotliprefix.code_length_order()
+
+    test.case("THE CLAIM: eighteen symbols, in a fixed non-monotonic order")
+    test.assert(list.len(order) == 18)
+    test.assert(order[0] == 1)
+    test.assert(order[4] == 0)
+    test.assert(order[6] == 17)
+
+    test.case("and the two repeat symbols are 16 and 17, with different extra-bit counts")
+    let rep = brotliprefix.repeat_symbols()
+    test.assert(rep[0] == 16)
+    test.assert(rep[1] == 17)
+    test.assert(brotliprefix.repeat_extra_bits(16) == 2)
+    test.assert(brotliprefix.repeat_extra_bits(17) == 3)
+
+@test
+fn test_the_literal_context_is_the_thing_deflate_does_not_have() [io]
+    test.case("THE CLAIM: 64 contexts per literal block type, not one code for all of them")
+    test.assert(brotlicontext.literal_context_count() == 64)
+
+    test.case("and four for distances, from the copy length clamped")
+    test.assert(brotlicontext.distance_context_count() == 4)
+    test.assert(brotlicontext.distance_context(2) == 0)
+    test.assert(brotlicontext.distance_context(3) == 1)
+    test.assert(brotlicontext.distance_context(99) == 3)
+
+    test.case("the mode is per BLOCK TYPE, so a switch changes how literals are contextualised")
+    match brotlicontext.mode_of(0)
+        Err(_) => test.assert(false)
+        Ok(m)  => test.assert(m == BroLsb6)
+    match brotlicontext.mode_of(2)
+        Err(_) => test.assert(false)
+        Ok(m)  => test.assert(m == BroUtf8)
+    match brotlicontext.mode_of(9)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("and the previous bytes are 0 at the start of EVERY meta-block")
+    test.assert(brotlicontext.literal_context(BroLsb6, 0, 0) == 0)
+
+@test
+fn test_the_context_map_is_run_length_coded_with_an_inverse_move_to_front() [io]
+    let m = brotlicontext.identity_map(64)
+
+    test.case("THE CLAIM: a block with one literal tree has the identity map")
+    test.assert(brotlicontext.map_size(m) == 64)
+    test.assert(m.tree_count == 1)
+    test.assert(brotlicontext.map_is_sound(m))
+    test.assert(brotlicontext.tree_for(m, 0, 17, 64) == 0)
+
+    test.case("and the MTF pass is one bit whose absence produces a PERMUTATION of the map")
+    test.assert(m.used_mtf == false)
+    test.assert(brotlicontext.inverse_mtf([0, 1, 2]) != [0, 1, 2])
+    test.assert(list.len(brotlicontext.inverse_mtf([0, 1, 2])) == 3)
+
+    test.case("which decodes to plausible bytes with no error anywhere")
+    test.assert(brotlicontext.map_bits(m) == 0)

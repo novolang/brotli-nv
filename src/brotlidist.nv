@@ -1,0 +1,221 @@
+// brotlidist.nv — one number, three meanings.  This module is the
+// package's load-bearing interface.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT A DISTANCE IS IN BROTLI, AND WHY IT IS NOT WHAT IT IS ANYWHERE
+// ELSE.  In deflate, in LZ4, in zstd, a distance is one thing: how far
+// back in the output to copy from, and a distance past the start of
+// the output is a corrupt stream.  In Brotli a distance code means one
+// of THREE things depending on where the resolved number falls:
+//
+//   0 to 15 — the LAST-DISTANCES CACHE.  The four most recent
+//   distances, plus twelve small adjustments of them (±1, ±2, ±3 on
+//   the two most recent).  A repeat is one code rather than a repeat
+//   of the number, which is where a lot of Brotli's advantage over
+//   deflate comes from on structured text.
+//
+//   16 to 16 + NDIRECT — DIRECT distances, the numbers themselves.
+//
+//   past that — the POSTFIX-coded range, which is the ordinary large
+//   distance with `NPOSTFIX` low bits carried separately.
+//
+// AND THEN, WHATEVER THE CODE SAID, A DISTANCE LARGER THAN THE NUMBER
+// OF BYTES PRODUCED SO FAR IS A REFERENCE INTO THE STATIC DICTIONARY.
+// Not an error.  The excess selects a word by length and index, and
+// the remainder selects one of 121 transforms to apply to it.  That is
+// how a Brotli stream can encode `<!DOCTYPE html>` in a handful of bits
+// on the first byte of the response, and it is why a Brotli decoder
+// without the dictionary decodes a large share of the web wrong.
+//
+// SO `resolve` ANSWERS A TYPED VALUE, NOT A NUMBER.  Every decoder
+// that gets this wrong gets it wrong in one of two ways, and both are
+// worth naming: one refuses the stream, and rejects a third of real
+// HTTP responses; the other clamps the distance into the window and
+// answers plausible garbage that no checksum catches, because Brotli
+// has no checksum.  A `BroReference` cannot be either — a caller has
+// to `match`, and the dictionary arm is the one it cannot forget to
+// write.
+
+use brotlierror
+
+// What a resolved distance actually names.
+//
+// Three variants, because the format has three answers and a caller
+// that received an `Int` would have to rediscover which one it had.
+pub enum BroReference
+    // Copy `length` bytes from `distance` back in the output the
+    // caller holds.  The ordinary case, and the only one the other LZ
+    // formats have.
+    BroBackRef(distance: Int, length: Int)
+    // Take the word of `length` bytes at `index` out of the static
+    // dictionary, apply transform `transform`, and append the result.
+    //
+    // The length of what is APPENDED is not `length`: a transform may
+    // add a prefix, a suffix, or both, and `brotlidict.transformed_len`
+    // is the number a caller sizing its output needs.
+    BroDictWord(length: Int, index: Int, transform: Int)
+    // The distance names a word length or index the dictionary does not
+    // have.
+    //
+    // A variant rather than a `Result`, deliberately: it is the ONE
+    // genuinely corrupt case in this resolution, and putting it beside
+    // the two good answers means a caller's `match` covers it in the
+    // same place it covers them, rather than in a `!` three lines up
+    // where it reads as unrelated.
+    BroDistOutOfRange(distance: Int, produced: Int)
+
+// The four most recent distances, newest first.
+//
+// `@value`: four integers carried through every symbol of the
+// decode, never a `Result` payload and never a boxed struct's field.
+//
+// The cache is SEEDED rather than empty — 16, 15, 11, 4 — which is a
+// fact from the specification and not an arbitrary choice: a stream
+// may reference the cache before it has produced any distance of its
+// own, and a decoder that started from zeroes decodes the first few
+// symbols of every stream wrong.
+pub @value
+struct BroDistCache
+    // The most recent distance.
+    d0: Int
+    // The one before it.
+    d1: Int
+    // The one before that.
+    d2: Int
+    // The oldest of the four.
+    d3: Int
+
+// How the distance code space is laid out for this meta-block.
+//
+// `@value`: two small integers read once per meta-block and carried
+// through every symbol.
+pub @value
+struct BroDistParams
+    // `NPOSTFIX`, 0 to 3: how many low bits of a large distance are
+    // carried outside the code.
+    npostfix: Int
+    // `NDIRECT`, 0 to 120 in steps of `1 << npostfix`: how many
+    // distances are encoded as themselves before the postfix range
+    // begins.
+    ndirect: Int
+
+// The seeded cache a stream starts from: 16, 15, 11, 4.
+//
+// Published as a function rather than as a comment, because it is a
+// number a decoder gets wrong silently — the first few symbols of
+// every stream come out different, and nothing in the format notices.
+pub fn initial_cache() -> BroDistCache []
+    todo("brotli-nv.brotlidist.initial_cache")
+
+// The default parameters: `npostfix` 0, `ndirect` 0.
+pub fn default_params() -> BroDistParams []
+    todo("brotli-nv.brotlidist.default_params")
+
+// How many distance codes the alphabet has for these parameters.
+//
+// `16 + ndirect + (48 << npostfix)`.  The size a caller building the
+// distance prefix code needs, and the number that makes the three
+// ranges' boundaries computable.
+pub fn alphabet_size(p: BroDistParams) -> Int []
+    todo("brotli-nv.brotlidist.alphabet_size")
+
+// How many extra bits a distance code carries.
+//
+// 0 for the cache codes and the direct codes, and a function of the
+// code and `npostfix` above that.  Published because a caller reading
+// the bit stream needs it before it can read them.
+pub fn extra_bits(p: BroDistParams, code: Int) -> Int []
+    todo("brotli-nv.brotlidist.extra_bits")
+
+// ── The three ranges ─────────────────────────────────────────────────
+
+// Whether the code names an entry of the last-distances cache.
+//
+// Codes 0 to 15.  Published so a caller can see the three ranges as
+// three predicates rather than as boundary arithmetic it has to
+// re-derive.
+pub fn is_cache_code(code: Int) -> Bool []
+    todo("brotli-nv.brotlidist.is_cache_code")
+
+// Whether the code names a distance directly.
+pub fn is_direct_code(p: BroDistParams, code: Int) -> Bool []
+    todo("brotli-nv.brotlidist.is_direct_code")
+
+// Whether the code is in the postfix-coded range.
+pub fn is_postfix_code(p: BroDistParams, code: Int) -> Bool []
+    todo("brotli-nv.brotlidist.is_postfix_code")
+
+// The distance a code and its extra bits name, before the dictionary
+// question is asked.
+//
+// The arithmetic of the three ranges, in one call.  A caller that
+// wants the number rather than the reference — an analyser, a
+// re-encoder — takes this and never meets `BroReference`.
+pub fn distance_of(p: BroDistParams, c: BroDistCache, code: Int, extra: Int) -> Int []
+    todo("brotli-nv.brotlidist.distance_of")
+
+// The cache after a distance has been used.
+//
+// A distance from a cache code that names `d0` does NOT move the
+// cache; every other distance pushes onto it.  That exception is in
+// the specification and is the second-most-common place a decoder goes
+// silently wrong, so it lives in this one function rather than at
+// every call site.
+pub fn push(c: BroDistCache, code: Int, distance: Int) -> BroDistCache []
+    todo("brotli-nv.brotlidist.push")
+
+// ── The call this module exists for ──────────────────────────────────
+
+// What a distance code, its extra bits and the output so far actually
+// name.
+//
+// THE LOAD-BEARING CALL OF THIS PACKAGE.  `produced` is how many bytes
+// the decoder has emitted since the start of the stream, and it is
+// what decides between a back reference and a dictionary word — which
+// is why it is an argument rather than something the package could
+// know.  `copy_len` is the copy length the length code already gave,
+// because a dictionary word's length comes from there and not from the
+// distance.
+//
+// ```novo ignore
+// match brotlidist.resolve(params, cache, code, extra, produced, copy_len)
+//     BroBackRef(d, n)              => copy_back(out, d, n)
+//     BroDictWord(len, ix, t)       => append(out, brotlidict.transformed(len, ix, t))
+//     BroDistOutOfRange(d, p)       => return Err(BroTruncated(p, d))
+// ```
+pub fn resolve(p: BroDistParams, c: BroDistCache, code: Int, extra: Int, produced: Int,
+               copy_len: Int) -> BroReference []
+    todo("brotli-nv.brotlidist.resolve")
+
+// Whether a resolved distance would reach the dictionary.
+//
+// `distance > produced`.  Published as its own predicate because it is
+// the sentence this whole module is about, and because a caller
+// auditing a stream — how much of this response came out of the
+// dictionary? — wants to ask it without building a reference.
+pub fn reaches_dictionary(distance: Int, produced: Int) -> Bool []
+    todo("brotli-nv.brotlidist.reaches_dictionary")
+
+// The maximum distance a stream with this window can express before it
+// reaches the dictionary.
+//
+// The window size itself.  What a caller sizing a buffer wants, and
+// what an encoder must not exceed.
+pub fn max_backward(window_size: Int) -> Int []
+    todo("brotli-nv.brotlidist.max_backward")
+
+// The copy lengths a dictionary reference may have: 4 to 24.
+//
+// A pair, low then high.  Outside it a distance that reached the
+// dictionary is `BroDistOutOfRange` rather than a word — which is the
+// check that stops a corrupt stream from indexing off the end of the
+// dictionary, and the reason the range is published rather than
+// hidden.
+pub fn dict_length_range() -> [Int] []
+    todo("brotli-nv.brotlidist.dict_length_range")
+
+// The refusal a `BroDistOutOfRange` should become, for a caller that
+// would rather propagate than match.
+pub fn out_of_range_fault(r: BroReference) -> ?brotlierror.BroFault []
+    todo("brotli-nv.brotlidist.out_of_range_fault")
