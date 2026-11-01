@@ -1,8 +1,6 @@
 // brotlidist.nv — one number, three meanings.  This module is the
 // package's load-bearing interface.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHAT A DISTANCE IS IN BROTLI, AND WHY IT IS NOT WHAT IT IS ANYWHERE
 // ELSE.  In deflate, in LZ4, in zstd, a distance is one thing: how far
 // back in the output to copy from, and a distance past the start of
@@ -37,7 +35,31 @@
 // to `match`, and the dictionary arm is the one it cannot forget to
 // write.
 
+use brotlidict
 use brotlierror
+
+// ── Internals ────────────────────────────────────────────────────────
+
+// The distance a cache code names (RFC 7932 section 4): one of the four
+// remembered distances, or the newest or second newest plus or minus
+// up to three.
+fn cache_distance(c: BroDistCache, code: Int) -> Int
+    if code == 0
+        c.d0
+    elif code == 1
+        c.d1
+    elif code == 2
+        c.d2
+    elif code == 3
+        c.d3
+    elif code < 10
+        c.d0 + ADJUST[code - 4]
+    else
+        c.d1 + ADJUST[code - 10]
+
+// The six adjustments, in the order the codes spell them: -1, +1, -2,
+// +2, -3, +3.
+const ADJUST: [Int] = [-1, 1, -2, 2, -3, 3]
 
 // What a resolved distance actually names.
 //
@@ -70,7 +92,8 @@ pub enum BroReference
 // `@value`: four integers carried through every symbol of the
 // decode, never a `Result` payload and never a boxed struct's field.
 //
-// The cache is SEEDED rather than empty — 16, 15, 11, 4 — which is a
+// The cache is SEEDED rather than empty — 4, 11, 15, 16, newest first,
+// so that the most recent distance is 4 — which is a
 // fact from the specification and not an arbitrary choice: a stream
 // may reference the cache before it has produced any distance of its
 // own, and a decoder that started from zeroes decodes the first few
@@ -100,17 +123,17 @@ struct BroDistParams
     // begins.
     ndirect: Int
 
-// The seeded cache a stream starts from: 16, 15, 11, 4.
+// The seeded cache a stream starts from: 4, 11, 15, 16, newest first.
 //
 // Published as a function rather than as a comment, because it is a
 // number a decoder gets wrong silently — the first few symbols of
 // every stream come out different, and nothing in the format notices.
 pub fn initial_cache() -> BroDistCache []
-    todo("brotli-nv.brotlidist.initial_cache")
+    BroDistCache { d0: 4, d1: 11, d2: 15, d3: 16 }
 
 // The default parameters: `npostfix` 0, `ndirect` 0.
 pub fn default_params() -> BroDistParams []
-    todo("brotli-nv.brotlidist.default_params")
+    BroDistParams { npostfix: 0, ndirect: 0 }
 
 // How many distance codes the alphabet has for these parameters.
 //
@@ -118,7 +141,7 @@ pub fn default_params() -> BroDistParams []
 // distance prefix code needs, and the number that makes the three
 // ranges' boundaries computable.
 pub fn alphabet_size(p: BroDistParams) -> Int []
-    todo("brotli-nv.brotlidist.alphabet_size")
+    16 + p.ndirect + (48 << p.npostfix)
 
 // How many extra bits a distance code carries.
 //
@@ -126,7 +149,10 @@ pub fn alphabet_size(p: BroDistParams) -> Int []
 // code and `npostfix` above that.  Published because a caller reading
 // the bit stream needs it before it can read them.
 pub fn extra_bits(p: BroDistParams, code: Int) -> Int []
-    todo("brotli-nv.brotlidist.extra_bits")
+    if code < 16 + p.ndirect
+        0
+    else
+        1 + ((code - p.ndirect - 16) >> (p.npostfix + 1))
 
 // ── The three ranges ─────────────────────────────────────────────────
 
@@ -136,15 +162,15 @@ pub fn extra_bits(p: BroDistParams, code: Int) -> Int []
 // three predicates rather than as boundary arithmetic it has to
 // re-derive.
 pub fn is_cache_code(code: Int) -> Bool []
-    todo("brotli-nv.brotlidist.is_cache_code")
+    code >= 0 and code < 16
 
 // Whether the code names a distance directly.
 pub fn is_direct_code(p: BroDistParams, code: Int) -> Bool []
-    todo("brotli-nv.brotlidist.is_direct_code")
+    code >= 16 and code < 16 + p.ndirect
 
 // Whether the code is in the postfix-coded range.
 pub fn is_postfix_code(p: BroDistParams, code: Int) -> Bool []
-    todo("brotli-nv.brotlidist.is_postfix_code")
+    code >= 16 + p.ndirect and code < alphabet_size(p)
 
 // The distance a code and its extra bits name, before the dictionary
 // question is asked.
@@ -153,7 +179,17 @@ pub fn is_postfix_code(p: BroDistParams, code: Int) -> Bool []
 // wants the number rather than the reference — an analyser, a
 // re-encoder — takes this and never meets `BroReference`.
 pub fn distance_of(p: BroDistParams, c: BroDistCache, code: Int, extra: Int) -> Int []
-    todo("brotli-nv.brotlidist.distance_of")
+    if code < 16
+        cache_distance(c, code)
+    elif code < 16 + p.ndirect
+        code - 15
+    else
+        let x = code - p.ndirect - 16
+        let nbits = 1 + (x >> (p.npostfix + 1))
+        let hcode = x >> p.npostfix
+        let lcode = x & ((1 << p.npostfix) - 1)
+        let offset = ((2 + (hcode & 1)) << nbits) - 4
+        ((offset + extra) << p.npostfix) + lcode + p.ndirect + 1
 
 // The cache after a distance has been used.
 //
@@ -163,30 +199,52 @@ pub fn distance_of(p: BroDistParams, c: BroDistCache, code: Int, extra: Int) -> 
 // silently wrong, so it lives in this one function rather than at
 // every call site.
 pub fn push(c: BroDistCache, code: Int, distance: Int) -> BroDistCache []
-    todo("brotli-nv.brotlidist.push")
+    if code == 0
+        c
+    else
+        BroDistCache { d0: distance, d1: c.d0, d2: c.d1, d3: c.d2 }
 
 // ── The call this module exists for ──────────────────────────────────
 
 // What a distance code, its extra bits and the output so far actually
 // name.
 //
-// THE LOAD-BEARING CALL OF THIS PACKAGE.  `produced` is how many bytes
-// the decoder has emitted since the start of the stream, and it is
+// THE LOAD-BEARING CALL OF THIS PACKAGE.  `produced` is how far back a
+// reference can reach: the bytes the decoder has emitted since the start
+// of the stream, or the window size when that is smaller, and it is
 // what decides between a back reference and a dictionary word — which
 // is why it is an argument rather than something the package could
 // know.  `copy_len` is the copy length the length code already gave,
 // because a dictionary word's length comes from there and not from the
 // distance.
 //
-// ```novo ignore
-// match brotlidist.resolve(params, cache, code, extra, produced, copy_len)
-//     BroBackRef(d, n)              => copy_back(out, d, n)
-//     BroDictWord(len, ix, t)       => append(out, brotlidict.transformed(len, ix, t))
-//     BroDistOutOfRange(d, p)       => return Err(BroTruncated(p, d))
+// ```novo
+// use brotlidist
+//
+// fn main() [io]
+//     let p = brotlidist.default_params()
+//     match brotlidist.resolve(p, brotlidist.initial_cache(), 20, 0, 10000, 6)
+//         BroBackRef(d, n) => println("copy ${n} from ${d} back")
+//         BroDictWord(len, ix, t) => println("word ${len}/${ix} with transform ${t}")
+//         BroDistOutOfRange(d, produced) => println("corrupt: ${d} past ${produced}")
 // ```
 pub fn resolve(p: BroDistParams, c: BroDistCache, code: Int, extra: Int, produced: Int,
                copy_len: Int) -> BroReference []
-    todo("brotli-nv.brotlidist.resolve")
+    let d = distance_of(p, c, code, extra)
+    if d < 1
+        BroDistOutOfRange(d, produced)
+    elif d <= produced
+        BroBackRef(d, copy_len)
+    elif copy_len < 4 or copy_len > 24
+        BroDistOutOfRange(d, produced)
+    else
+        let word_id = d - produced - 1
+        let nbits = brotlidict.index_bits(copy_len)
+        let transform = word_id >> nbits
+        if transform > 120
+            BroDistOutOfRange(d, produced)
+        else
+            BroDictWord(copy_len, word_id & ((1 << nbits) - 1), transform)
 
 // Whether a resolved distance would reach the dictionary.
 //
@@ -195,7 +253,7 @@ pub fn resolve(p: BroDistParams, c: BroDistCache, code: Int, extra: Int, produce
 // auditing a stream — how much of this response came out of the
 // dictionary? — wants to ask it without building a reference.
 pub fn reaches_dictionary(distance: Int, produced: Int) -> Bool []
-    todo("brotli-nv.brotlidist.reaches_dictionary")
+    distance > produced
 
 // The maximum distance a stream with this window can express before it
 // reaches the dictionary.
@@ -203,7 +261,7 @@ pub fn reaches_dictionary(distance: Int, produced: Int) -> Bool []
 // The window size itself.  What a caller sizing a buffer wants, and
 // what an encoder must not exceed.
 pub fn max_backward(window_size: Int) -> Int []
-    todo("brotli-nv.brotlidist.max_backward")
+    window_size
 
 // The copy lengths a dictionary reference may have: 4 to 24.
 //
@@ -213,9 +271,11 @@ pub fn max_backward(window_size: Int) -> Int []
 // dictionary, and the reason the range is published rather than
 // hidden.
 pub fn dict_length_range() -> [Int] []
-    todo("brotli-nv.brotlidist.dict_length_range")
+    [4, 24]
 
 // The refusal a `BroDistOutOfRange` should become, for a caller that
 // would rather propagate than match.
 pub fn out_of_range_fault(r: BroReference) -> ?brotlierror.BroFault []
-    todo("brotli-nv.brotlidist.out_of_range_fault")
+    match r
+        BroDistOutOfRange(d, produced) => Some(BroBadDistance(d, produced))
+        _                              => None

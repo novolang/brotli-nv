@@ -1,8 +1,6 @@
 // brotliblock.nv — meta-blocks: how much, of what kind, and whether
 // it is the last one.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A BROTLI STREAM IS A SEQUENCE OF META-BLOCKS and nothing else.  Each
 // one declares its uncompressed length, says whether it is compressed
 // data, stored bytes or metadata, and says whether it is the last.
@@ -26,6 +24,95 @@
 // only one of them would be called three times over the same bits.
 
 use brotlierror
+use brotlistream
+
+// ── Internals ────────────────────────────────────────────────────────
+
+// The insert length codes and the copy length codes of RFC 7932
+// section 5: the smallest length each covers, and how many extra bits
+// pick one inside it.
+const INSERT_BASE: [Int] = [0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    10,
+    14,
+    18,
+    26,
+    34,
+    50,
+    66,
+    98,
+    130,
+    194,
+    322,
+    578,
+    1090,
+    2114,
+    6210,
+    22594]
+const INSERT_EXTRA: [Int] = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24]
+const COPY_BASE: [Int] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582, 1094, 2118]
+const COPY_EXTRA: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24]
+
+// Where the insert and the copy ranges of each group of 64 command
+// codes start: the 704 codes are eleven cells, each pairing a range of
+// eight insert codes with a range of eight copy codes.
+const CELL_INSERT: [Int] = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+const CELL_COPY: [Int] = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+
+// The smallest block count each of the 26 block-count symbols covers,
+// and its extra bits.
+const BLOCK_BASE: [Int] = [1,
+    5,
+    9,
+    13,
+    17,
+    25,
+    33,
+    41,
+    49,
+    65,
+    81,
+    97,
+    113,
+    145,
+    177,
+    209,
+    241,
+    305,
+    369,
+    497,
+    753,
+    1265,
+    2289,
+    4337,
+    8433,
+    16625]
+const BLOCK_EXTRA: [Int] = [2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24]
+
+// The insert length code a command code names.
+fn insert_code_of(code: Int) -> Int
+    CELL_INSERT[min_cell(code)] + ((code >> 3) & 7)
+
+// The copy length code a command code names.
+fn copy_code_of(code: Int) -> Int
+    CELL_COPY[min_cell(code)] + (code & 7)
+
+// The cell a command code falls in, 0 to 10; codes past the alphabet
+// are held in the last cell.
+fn min_cell(code: Int) -> Int
+    let cell = code >> 6
+    if cell > 10
+        10
+    elif cell < 0
+        0
+    else
+        cell
 
 // What a meta-block carries.
 pub enum BroBlockKind
@@ -69,7 +156,8 @@ pub struct BroBlockHeader
 // payload is — and a caller that rounded would start the next header
 // in the middle of the previous one.
 pub fn parse_header(src: Bytes, at_bit: Int) -> Result<BroBlockHeader, brotlierror.BroFault> []
-    todo("brotli-nv.brotliblock.parse_header")
+    var r = brotlistream.reader(src, at_bit)
+    read_header_from(var r)
 
 // The largest output one meta-block may declare: 16 MiB.
 //
@@ -79,7 +167,7 @@ pub fn parse_header(src: Bytes, at_bit: Int) -> Result<BroBlockHeader, brotlierr
 // same as the window size — a common confusion, since the two numbers
 // coincide at the largest window.
 pub fn max_block_length() -> Int []
-    todo("brotli-nv.brotliblock.max_block_length")
+    16777216
 
 // Whether the block's payload begins on a byte boundary.
 //
@@ -87,11 +175,15 @@ pub fn max_block_length() -> Int []
 // reader aligns, published so a caller driving its own reader does not
 // have to infer it from the kind.
 pub fn payload_is_aligned(h: BroBlockHeader) -> Bool []
-    todo("brotli-nv.brotliblock.payload_is_aligned")
+    h.kind == BroStored or h.kind == BroMetadata
 
 // Where the payload begins, as a BIT position.
 pub fn payload_at(h: BroBlockHeader, at_bit: Int) -> Int []
-    todo("brotli-nv.brotliblock.payload_at")
+    let end = at_bit + h.header_bits
+    if payload_is_aligned(h)
+        (end + 7) / 8 * 8
+    else
+        end
 
 // Whether the block contributes anything to the output.
 //
@@ -99,7 +191,7 @@ pub fn payload_at(h: BroBlockHeader, at_bit: Int) -> Int []
 // decoder's loop reads rather than a two-armed `match` in three
 // places.
 pub fn produces_output(h: BroBlockHeader) -> Bool []
-    todo("brotli-nv.brotliblock.produces_output")
+    h.kind == BroCompressed or h.kind == BroStored
 
 // ── The three prefix-code categories ─────────────────────────────────
 
@@ -121,7 +213,14 @@ pub enum BroCategory
 //
 // `BroBadBlockType` when a switch names a type past this.
 pub fn block_type_count(counts: [Int], c: BroCategory) -> Int []
-    todo("brotli-nv.brotliblock.block_type_count")
+    let i = match c
+        BroLiterals   => 0
+        BroInsertCopy => 1
+        BroDistances  => 2
+    if i < list.len(counts)
+        counts[i]
+    else
+        1
 
 // The block-switch state for one category.
 //
@@ -149,15 +248,15 @@ struct BroBlockState
 // selects type 1, and a decoder that seeded both to 0 selects type 0
 // and decodes the whole block with the wrong prefix code.
 pub fn initial_block_state(first_run: Int) -> BroBlockState []
-    todo("brotli-nv.brotliblock.initial_block_state")
+    BroBlockState { current: 0, previous: 1, remaining: first_run }
 
 // The state after one symbol has been consumed.
 pub fn consume(s: BroBlockState) -> BroBlockState []
-    todo("brotli-nv.brotliblock.consume")
+    BroBlockState { current: s.current, previous: s.previous, remaining: s.remaining - 1 }
 
 // Whether the next symbol needs a block switch read first.
 pub fn needs_switch(s: BroBlockState) -> Bool []
-    todo("brotli-nv.brotliblock.needs_switch")
+    s.remaining <= 0
 
 // The state after a block-switch code and its run length.
 //
@@ -166,7 +265,16 @@ pub fn needs_switch(s: BroBlockState) -> Bool []
 // The three readings are here rather than at the call site because
 // two of them are relative and both are easy to get backwards.
 pub fn switch_to(s: BroBlockState, code: Int, type_count: Int, run: Int) -> BroBlockState []
-    todo("brotli-nv.brotliblock.switch_to")
+    let next = if code == 0
+        s.previous
+    elif code == 1
+        if s.current + 1 >= type_count
+            s.current + 1 - type_count
+        else
+            s.current + 1
+    else
+        code - 2
+    BroBlockState { current: next, previous: s.current, remaining: run }
 
 // ── Insert-and-copy ──────────────────────────────────────────────────
 
@@ -197,15 +305,17 @@ struct BroCommand
 // ranges plus extra bits, which is where the format is at its least
 // readable and where a hand-written decoder has its off-by-ones.
 pub fn command_of(code: Int, insert_extra: Int, copy_extra: Int) -> BroCommand []
-    todo("brotli-nv.brotliblock.command_of")
+    BroCommand { insert: INSERT_BASE[insert_code_of(code)] + insert_extra,
+                 copy: COPY_BASE[copy_code_of(code)] + copy_extra,
+                 implicit_distance: code < 128 }
 
 // How many extra bits the insert half of a code carries.
 pub fn insert_extra_bits(code: Int) -> Int []
-    todo("brotli-nv.brotliblock.insert_extra_bits")
+    INSERT_EXTRA[insert_code_of(code)]
 
 // How many extra bits the copy half carries.
 pub fn copy_extra_bits(code: Int) -> Int []
-    todo("brotli-nv.brotliblock.copy_extra_bits")
+    COPY_EXTRA[copy_code_of(code)]
 
 // Whether a code reuses the last distance rather than reading one.
 //
@@ -213,8 +323,205 @@ pub fn copy_extra_bits(code: Int) -> Int []
 // desynchronises a decoder completely when missed, and a caller
 // auditing a stream wants to count them.
 pub fn uses_implicit_distance(code: Int) -> Bool []
-    todo("brotli-nv.brotliblock.uses_implicit_distance")
+    code < 128
 
 // How many insert-and-copy codes the alphabet has: 704.
 pub fn command_alphabet_size() -> Int []
-    todo("brotli-nv.brotliblock.command_alphabet_size")
+    704
+
+// ── Reading a header from a reader ───────────────────────────────────
+
+// A meta-block header read from the cursor, which is left just after
+// it.
+//
+// RFC 7932 section 9.2: the last flag, an empty-last flag, the number
+// of nibbles of length (4 to 6, or 0 for metadata), the length, and for
+// a block that is not the last a flag that says the payload is stored.
+//
+// ```novo
+// use std.bytes
+// use brotliblock
+// use brotlistream
+//
+// fn main() [io]
+//     var r = brotlistream.reader(bytes.from_byte_list([3]), 0)
+//     match brotliblock.read_header_from(var r)
+//         Ok(h) => println("${h.is_last}")   // true
+//         Err(_) => println("refused")
+// ```
+pub fn read_header_from(var r: BroReader) -> Result<BroBlockHeader, BroFault> []
+    let start = r.pos
+    let at = start / 8
+    let last = brotlistream.read_bits(var r, 1) == 1
+    if last and brotlistream.read_bits(var r, 1) == 1
+        Ok(BroBlockHeader { kind: BroLastEmpty, length: 0, skip_len: 0, is_last: true,
+                            header_bits: r.pos - start })
+    else
+        let nibbles = brotlistream.read_bits(var r, 2) + 4
+        if nibbles == 7
+            read_metadata_header(var r, start, last)
+        else
+            read_data_header(var r, start, last, nibbles)
+
+// A metadata header: a reserved bit, the number of bytes of skip
+// length, and the skip length.
+fn read_metadata_header(var r: BroReader, start: Int,
+                        last: Bool) -> Result<BroBlockHeader, BroFault>
+    let at = start / 8
+    let reserved = brotlistream.read_bits(var r, 1)
+    let skip_bytes = brotlistream.read_bits(var r, 2)
+    var skip = 0
+    for k in 0..skip_bytes
+        skip = skip | (brotlistream.read_bits(var r, 8) << (8 * k))
+    if r.over
+        Err(BroTruncated(at, 1))
+    elif reserved != 0
+        Err(BroBadMetaBlock(at, "reserved bit"))
+    elif skip_bytes > 1 and (skip >> (8 * (skip_bytes - 1))) == 0
+        Err(BroBadMetaBlock(at, "metadata length"))
+    else
+        let n = if skip_bytes == 0
+            0
+        else
+            skip + 1
+        Ok(BroBlockHeader { kind: BroMetadata, length: 0, skip_len: n, is_last: last,
+                            header_bits: r.pos - start })
+
+// A header with a length: the length in nibbles, and the stored flag.
+fn read_data_header(var r: BroReader, start: Int, last: Bool,
+                    nibbles: Int) -> Result<BroBlockHeader, BroFault>
+    let at = start / 8
+    var len = 0
+    var top = 1
+    for k in 0..nibbles
+        top = brotlistream.read_bits(var r, 4)
+        len = len | (top << (4 * k))
+    let stored = not last and brotlistream.read_bits(var r, 1) == 1
+    if r.over
+        Err(BroTruncated(at, 1))
+    elif nibbles > 4 and top == 0
+        Err(BroBadMetaBlock(at, "length"))
+    else
+        let kind = if stored
+            BroStored
+        else
+            BroCompressed
+        Ok(BroBlockHeader { kind: kind, length: len + 1, skip_len: 0, is_last: last,
+                            header_bits: r.pos - start })
+
+// The number of block-count symbols: 26.
+//
+// ```novo
+// use brotliblock
+//
+// fn main() [io]
+//     println("${brotliblock.block_count_symbols()}")   // 26
+// ```
+pub fn block_count_symbols() -> Int []
+    26
+
+// How many extra bits block-count symbol `symbol` carries, 0 to 25.
+pub fn block_count_extra_bits(symbol: Int) -> Int []
+    if symbol < 0 or symbol > 25
+        0
+    else
+        BLOCK_EXTRA[symbol]
+
+// The block count symbol `symbol` and its extra bits name: how many
+// symbols the block lasts.
+//
+// ```novo
+// use brotliblock
+//
+// fn main() [io]
+//     println("${brotliblock.block_count_of(4, 5)}")   // 22
+// ```
+pub fn block_count_of(symbol: Int, extra: Int) -> Int []
+    if symbol < 0 or symbol > 25
+        0
+    else
+        BLOCK_BASE[symbol] + extra
+
+// ── The command tables, for an encoder ───────────────────────────────
+
+// The insert length code for an insert of `length` literals: the largest
+// code whose smallest length is at most `length`.
+//
+// ```novo
+// use brotliblock
+//
+// fn main() [io]
+//     println("${brotliblock.insert_code_for(9)}")   // 8
+// ```
+pub fn insert_code_for(length: Int) -> Int []
+    var code = 23
+    while code > 0 and INSERT_BASE[code] > length
+        code = code - 1
+    code
+
+// The copy length code for a copy of `length` bytes.
+//
+// ```novo
+// use brotliblock
+//
+// fn main() [io]
+//     println("${brotliblock.copy_code_for(11)}")   // 9
+// ```
+pub fn copy_code_for(length: Int) -> Int []
+    var code = 23
+    while code > 0 and COPY_BASE[code] > length
+        code = code - 1
+    code
+
+// The smallest insert length insert code `code` covers, and how many
+// extra bits pick one inside it, as a pair.
+pub fn insert_range(code: Int) -> [Int] []
+    [INSERT_BASE[code], INSERT_EXTRA[code]]
+
+// The smallest copy length copy code `code` covers, and how many extra
+// bits pick one inside it, as a pair.
+pub fn copy_range(code: Int) -> [Int] []
+    [COPY_BASE[code], COPY_EXTRA[code]]
+
+// The insert-and-copy command code for an insert length code and a copy
+// length code, with the distance implicit (reusing the last one) when
+// `implicit` is set and the pair allows it.  Answers -1 for a pair no
+// implicit cell holds: the implicit cells cover insert codes 0 to 7 with
+// copy codes 0 to 15.
+//
+// ```novo
+// use brotliblock
+//
+// fn main() [io]
+//     println("${brotliblock.command_code(0, 0, false)}")   // 128
+// ```
+pub fn command_code(insert_code: Int, copy_code: Int, implicit: Bool) -> Int []
+    let gi = insert_code >> 3
+    let gc = copy_code >> 3
+    let cell = if implicit
+        if gi == 0 and gc < 2
+            gc
+        else
+            0 - 1
+    elif gi == 0 and gc == 0
+        2
+    elif gi == 0 and gc == 1
+        3
+    elif gi == 1 and gc == 0
+        4
+    elif gi == 1 and gc == 1
+        5
+    elif gi == 0
+        6
+    elif gc == 0
+        7
+    elif gi == 1
+        8
+    elif gc == 1
+        9
+    else
+        10
+    if cell < 0
+        0 - 1
+    else
+        cell * 64 + (insert_code & 7) * 8 + (copy_code & 7)
