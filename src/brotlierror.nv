@@ -1,8 +1,6 @@
 // brotlierror.nv — what a Brotli stream can be refused for, and the
 // one thing that looks like a refusal and is not.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ABSENCE WORTH NAMING FIRST.  There is no `BroDistanceTooFar`.
 // In every other LZ format a backward reference past the start of the
 // output is a corrupt stream; in Brotli it is a reference into the
@@ -73,18 +71,28 @@ pub enum BroFault
     // A dictionary reference names a transform this package does not
     // apply.  `brotlidict.transform_count` is how many there are.
     BroBadTransform(id: Int)
+    // A distance names nothing: it is zero or less after a cache
+    // adjustment, or past the output and not a word the dictionary
+    // holds (a copy length outside 4 to 24, or a transform id past 120).
+    //
+    // The one corrupt case of distance resolution, kept apart from
+    // `BroBadDictWord`, which says a word that was asked for by length
+    // and index is not there.
+    BroBadDistance(distance: Int, produced: Int)
     // The decoder produced more bytes than the meta-block's declared
     // length, which means the stream disagrees with itself.
     BroLengthMismatch(declared: Int, produced: Int)
     // The encoder was asked for a quality level it does not implement.
     // `brotlienc.quality_range` is the pair it does.
     BroBadQuality(want: Int)
-    // The caller's output buffer has no room left and the decoder has
-    // more to give.
+    // The stream has produced more than `BroLimits.max_output` allowed.
+    // `pending` is how many bytes past the bound the decoder had
+    // produced when it stopped.
     //
-    // Not a failure of the stream: it is the decoder saying the caller
-    // must drain.  Separate from `BroNeedMore` because the two ask the
-    // caller for opposite things.
+    // A budget fault, not a failure of the stream: raise the bound, or
+    // stop.  (The decoder's request that the caller drain a full buffer
+    // is `BroWantsDrain`, a step and not a fault.)  The encoder also
+    // answers it, with 0, when it is written to after it was finished.
     BroOutputFull(pending: Int)
 
 // Whether the fault is about a budget the caller chose rather than
@@ -94,12 +102,22 @@ pub enum BroFault
 // the response is different in kind — raise the budget, or drain —
 // from every other fault here, which all mean the bytes are wrong.
 pub fn is_budget(f: BroFault) -> Bool []
-    todo("brotli-nv.brotlierror.is_budget")
+    match f
+        BroWindowTooLarge(_, _) => true
+        BroOutputFull(_)        => true
+        _                       => false
 
 // Where in the compressed stream the fault was found, or -1 when the
 // fault is not about a position.
 pub fn fault_at(f: BroFault) -> Int []
-    todo("brotli-nv.brotlierror.fault_at")
+    match f
+        BroTruncated(at, _)       => at
+        BroBadPrefixCode(at, _)   => at
+        BroBadSimpleCode(at, _)   => at
+        BroBadMetaBlock(at, _)    => at
+        BroBadBlockType(at, _, _) => at
+        BroBadContextMap(at, _)   => at
+        _                         => 0 - 1
 
 // One line a person can read, naming the numbers.
 //
@@ -110,7 +128,21 @@ pub fn fault_at(f: BroFault) -> Int []
 //     println(brotlierror.describe(BroWindowTooLarge(16777216, 1048576)))
 // ```
 pub fn describe(f: BroFault) -> Str []
-    todo("brotli-nv.brotlierror.describe")
+    match f
+        BroWindowTooLarge(want, limit)        => "brotli: the stream asks for a window of ${want} bytes and the limit is ${limit}"
+        BroBadWindowBits(bits)                => "brotli: the window bits field ${bits} is not defined"
+        BroTruncated(at, need)                => "brotli: the stream ends at byte ${at} and ${need} more bits were needed"
+        BroBadPrefixCode(at, total)           => "brotli: the prefix code at byte ${at} is not complete, its Kraft sum is ${total} of 32768"
+        BroBadSimpleCode(at, count)           => "brotli: the simple prefix code at byte ${at} is invalid (${count} symbols)"
+        BroBadMetaBlock(at, field)            => "brotli: the meta-block header at byte ${at} has a bad ${field}"
+        BroBadBlockType(at, kind, count)      => "brotli: the block switch at byte ${at} names a type of category ${kind} past the ${count} declared"
+        BroBadContextMap(at, size)            => "brotli: the context map at byte ${at} is invalid (size ${size})"
+        BroBadDictWord(length, index)         => "brotli: the dictionary has no word of length ${length} at index ${index}"
+        BroBadTransform(id)                   => "brotli: transform ${id} is not in the table of 121"
+        BroBadDistance(distance, produced)    => "brotli: distance ${distance} reaches neither the ${produced} bytes produced nor a dictionary word"
+        BroLengthMismatch(declared, produced) => "brotli: the meta-block declares ${declared} bytes and produced ${produced}"
+        BroBadQuality(want)                   => "brotli: quality ${want} is not implemented, the range is 0 to 4"
+        BroOutputFull(pending)                => "brotli: the output buffer is full with ${pending} bytes waiting"
 
 // The `Error` implementation `Result<_, BroFault>` requires.
 //
@@ -127,4 +159,4 @@ pub fn describe(f: BroFault) -> Str []
 // ```
 impl Error for BroFault
     fn message(self) -> Str
-        todo("brotli-nv.brotlierror.message")
+        describe(self)

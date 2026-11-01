@@ -1,8 +1,6 @@
 // brotliprefix.nv — prefix codes, in the two shapes the format writes
 // them.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // TWO REPRESENTATIONS, AND THE SMALL ONE IS NOT AN OPTIMISATION.  A
 // Brotli prefix code is either SIMPLE — one to four symbols listed
 // outright, with the lengths implied by the count — or COMPLEX, a
@@ -30,7 +28,9 @@
 // symbol always, consuming no bits.  `is_single_symbol` is how a
 // caller tells that from a hole.
 
+use std.bytes
 use brotlierror
+use brotlistream
 
 // A prefix code, ready to decode with.
 //
@@ -47,6 +47,10 @@ pub struct BroPrefix
     // The single symbol this code always answers, or -1 when it is an
     // ordinary code.  See `is_single_symbol`.
     single: Int
+    // How many bits the code occupied in the stream it was read from,
+    // or 0 for a code that was built rather than read.  What
+    // `code_bits` answers.
+    bits: Int
 
 // A simple prefix code as the stream writes it, before it becomes a
 // `BroPrefix`.
@@ -62,9 +66,235 @@ pub struct BroSimple
     // 2/2/2/2, true for 1/2/3/3.
     tree_select: Bool
 
+// A prefix code laid out for decoding: how many symbols have each code
+// length, and the symbols ordered by length and then by value.
+//
+// Built once from a `BroPrefix` and read many times, which is why the
+// decoder keeps these and not the lengths.
+pub struct BroTable
+    // `counts[l]` is the number of symbols whose code is `l` bits long;
+    // entry 0 is unused.
+    counts: [Int]
+    // The symbols in canonical order.
+    symbols: [Int]
+    // The symbol a one-symbol code answers, or -1.
+    single: Int
+
+// ── Internals ────────────────────────────────────────────────────────
+
+// How a length of the code-length code is spelled: four bits are looked
+// at, and the table says how many of them the length used and what it
+// was (RFC 7932 section 3.5).
+const CL_LEN: [Int] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+const CL_VALUE: [Int] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+
+// The number of bits in `n`: 0 for 0, 8 for 255.
+fn bit_width(n: Int) -> Int
+    var w = 0
+    var m = n
+    while m > 0
+        w = w + 1
+        m = m >> 1
+    w
+
+// The prefix code a list of lengths names: refused unless it is
+// complete, or has exactly one symbol, which is the one code that may
+// be incomplete and answers without reading a bit.
+fn prefix_of_lengths(lengths: [Int], nbits: Int) -> Result<BroPrefix, BroFault>
+    var live = 0
+    var last = 0 - 1
+    var too_long = false
+    for i in 0..list.len(lengths)
+        let l = lengths[i]
+        if l > 15 or l < 0
+            too_long = true
+        elif l > 0
+            live = live + 1
+            last = i
+    let total = kraft_sum(lengths)
+    if too_long or live == 0 or live > 1 and total != 32768
+        Err(BroBadPrefixCode(nbits / 8, total))
+    elif live == 1
+        Ok(BroPrefix { lengths: list.zeros(list.len(lengths)), live: 1, single: last, bits: nbits })
+    else
+        Ok(BroPrefix { lengths: lengths, live: live, single: 0 - 1, bits: nbits })
+
+// The lengths a simple code stands for (RFC 7932 section 3.4).
+fn simple_lengths(s: BroSimple, alphabet_size: Int) -> [Int]
+    var lengths = list.zeros(alphabet_size)
+    let n = list.len(s.symbols)
+    if n == 2
+        lengths = put_length(lengths, s.symbols[0], 1)
+        lengths = put_length(lengths, s.symbols[1], 1)
+    elif n == 3
+        lengths = put_length(lengths, s.symbols[0], 1)
+        lengths = put_length(lengths, s.symbols[1], 2)
+        lengths = put_length(lengths, s.symbols[2], 2)
+    elif n == 4 and not s.tree_select
+        for k in 0..4
+            lengths = put_length(lengths, s.symbols[k], 2)
+    elif n == 4
+        lengths = put_length(lengths, s.symbols[0], 1)
+        lengths = put_length(lengths, s.symbols[1], 2)
+        lengths = put_length(lengths, s.symbols[2], 3)
+        lengths = put_length(lengths, s.symbols[3], 3)
+    lengths
+
+// `lengths` with symbol `sym` given length `len`, if the symbol is in
+// the alphabet.
+fn put_length(lengths: [Int], sym: Int, len: Int) -> [Int]
+    var out = lengths[:]
+    if sym >= 0 and sym < list.len(out)
+        out[sym] = len
+    out
+
+// A simple code as a prefix code.
+fn build_simple(s: BroSimple, alphabet_size: Int) -> BroPrefix
+    let n = list.len(s.symbols)
+    let width = bit_width(alphabet_size - 1)
+    let nbits = 4 + n * width + (if n == 4 then 1 else 0)
+    if n == 1
+        BroPrefix { lengths: list.zeros(alphabet_size), live: 1, single: s.symbols[0], bits: nbits }
+    else
+        BroPrefix { lengths: simple_lengths(s, alphabet_size), live: n, single: 0 - 1, bits: nbits }
+
+// A simple code read from the cursor, which sits just after the two
+// bits that said the code is simple.
+fn read_simple_body(var r: BroReader, alphabet_size: Int) -> Result<BroSimple, BroFault>
+    let at = r.pos / 8
+    let count = brotlistream.read_bits(var r, 2) + 1
+    let width = bit_width(alphabet_size - 1)
+    var symbols = [] as [Int]
+    var bad = false
+    for _ in 0..count
+        let sym = brotlistream.read_bits(var r, width)
+        if sym >= alphabet_size or list_has(symbols, sym)
+            bad = true
+        symbols = list.push(symbols, sym)
+    let select = count == 4 and brotlistream.read_bits(var r, 1) == 1
+    if r.over
+        Err(BroTruncated(at, 1))
+    elif bad
+        Err(BroBadSimpleCode(at, count))
+    else
+        Ok(BroSimple { symbols: symbols, tree_select: select })
+
+// Whether `xs` holds `x`.
+fn list_has(xs: [Int], x: Int) -> Bool
+    var found = false
+    for y in xs
+        if y == x
+            found = true
+    found
+
+// A simple code with the two header bits read already.
+fn read_simple_from(var r: BroReader, alphabet_size: Int) -> Result<BroSimple, BroFault>
+    if brotlistream.peek_bits(r, 2) != 1
+        Err(BroBadSimpleCode(r.pos / 8, 0))
+    else
+        brotlistream.skip_bits(var r, 2)
+        read_simple_body(var r, alphabet_size)
+
+// Whichever shape of code is at the cursor.
+fn read_from(var r: BroReader, alphabet_size: Int) -> Result<BroPrefix, BroFault>
+    let start = r.pos
+    let hskip = brotlistream.read_bits(var r, 2)
+    if hskip == 1
+        match read_simple_body(var r, alphabet_size)
+            Err(e) => Err(e)
+            Ok(s)  =>
+                let p = build_simple(s, alphabet_size)
+                Ok(BroPrefix { lengths: p.lengths,
+                    live: p.live,
+                    single: p.single,
+                    bits: r.pos - start })
+    else
+        read_complex_from(var r, alphabet_size, hskip, start)
+
+// The lengths of the code-length code, in the order the stream writes
+// them, from entry `hskip`.  Stops as soon as the lengths fill the code.
+fn read_code_length_code(var r: BroReader, hskip: Int) -> Result<BroPrefix, BroFault>
+    let order = code_length_order()
+    var lengths = list.zeros(18)
+    var space = 32
+    var codes = 0
+    var i = hskip
+    while i < 18 and space > 0
+        let v = brotlistream.peek_bits(r, 4)
+        brotlistream.skip_bits(var r, CL_LEN[v])
+        let len = CL_VALUE[v]
+        lengths[order[i]] = len
+        if len != 0
+            space = space - (32 >> len)
+            codes = codes + 1
+        i = i + 1
+    if r.over
+        Err(BroTruncated(r.pos / 8, 1))
+    elif codes != 1 and space != 0
+        Err(BroBadPrefixCode(r.pos / 8, kraft_sum(lengths)))
+    else
+        prefix_of_lengths(lengths, 0)
+
+// A complex code: the code-length code, then the lengths it spells,
+// with 16 and 17 repeating the previous non-zero length and zero
+// (RFC 7932 section 3.5).
+fn read_complex_from(var r: BroReader, alphabet_size: Int, hskip: Int,
+                     start: Int) -> Result<BroPrefix, BroFault>
+    match read_code_length_code(var r, hskip)
+        Err(e) => Err(e)
+        Ok(cl) => read_lengths(var r, alphabet_size, table_of(cl), start)
+
+// The symbol lengths of a complex code, read with the code-length code.
+fn read_lengths(var r: BroReader, alphabet_size: Int, cl: BroTable,
+                start: Int) -> Result<BroPrefix, BroFault>
+    var lengths = list.zeros(alphabet_size)
+    var sym = 0
+    var prev = 8
+    var repeat = 0
+    var repeat_len = 0
+    var space = 32768
+    var bad = false
+    while sym < alphabet_size and space > 0 and not r.over and not bad
+        let code = decode_with(cl, var r)
+        if code < 16
+            repeat = 0
+            lengths[sym] = code
+            sym = sym + 1
+            if code != 0
+                prev = code
+                space = space - (32768 >> code)
+        else
+            let extra = code - 14
+            let new_len = if code == 16
+                prev
+            else
+                0
+            if repeat_len != new_len
+                repeat = 0
+                repeat_len = new_len
+            let old = repeat
+            if repeat > 0
+                repeat = (repeat - 2) << extra
+            repeat = repeat + brotlistream.read_bits(var r, extra) + 3
+            let delta = repeat - old
+            if sym + delta > alphabet_size
+                bad = true
+            else
+                for k in 0..delta
+                    lengths[sym + k] = repeat_len
+                sym = sym + delta
+                if repeat_len != 0
+                    space = space - delta * (32768 >> repeat_len)
+    if r.over
+        Err(BroTruncated(r.pos / 8, 1))
+    elif bad or space != 0
+        Err(BroBadPrefixCode(start / 8, kraft_sum(lengths)))
+    else
+        prefix_of_lengths(lengths, r.pos - start)
+
 // The largest code length the format allows: 15.
 pub fn max_code_length() -> Int []
-    todo("brotli-nv.brotliprefix.max_code_length")
+    15
 
 // The complete Kraft sum, scaled: 32768.
 //
@@ -72,11 +302,11 @@ pub fn max_code_length() -> Int []
 // against, and a caller reading that fault should not have to know
 // that `1 << 15` is the scale.
 pub fn complete_sum() -> Int []
-    todo("brotli-nv.brotliprefix.complete_sum")
+    32768
 
 // How many symbols a simple code may list, as a pair: 1 and 4.
 pub fn simple_count_range() -> [Int] []
-    todo("brotli-nv.brotliprefix.simple_count_range")
+    [1, 4]
 
 // ── Reading a code ───────────────────────────────────────────────────
 
@@ -85,7 +315,7 @@ pub fn simple_count_range() -> [Int] []
 // The dispatch at the head of every code in the format, published so a
 // caller driving its own reader does not re-derive it.
 pub fn is_simple_at(src: Bytes, at_bit: Int) -> Bool []
-    todo("brotli-nv.brotliprefix.is_simple_at")
+    brotlistream.peek_bits(brotlistream.reader(src, at_bit), 2) == 1
 
 // Read a simple code.
 //
@@ -95,7 +325,8 @@ pub fn is_simple_at(src: Bytes, at_bit: Int) -> Bool []
 // checked the count would accept.
 pub fn read_simple(src: Bytes, at_bit: Int,
                    alphabet_size: Int) -> Result<BroSimple, brotlierror.BroFault> []
-    todo("brotli-nv.brotliprefix.read_simple")
+    var r = brotlistream.reader(src, at_bit)
+    read_simple_from(var r, alphabet_size)
 
 // A simple code turned into a prefix code.
 //
@@ -103,7 +334,7 @@ pub fn read_simple(src: Bytes, at_bit: Int,
 // that a caller reporting on a stream can see the simple form as the
 // stream wrote it and the code it became.
 pub fn prefix_of_simple(s: BroSimple, alphabet_size: Int) -> BroPrefix []
-    todo("brotli-nv.brotliprefix.prefix_of_simple")
+    build_simple(s, alphabet_size)
 
 // Read a complex code: the code-length code, then the lengths it
 // encodes.
@@ -112,7 +343,10 @@ pub fn prefix_of_simple(s: BroSimple, alphabet_size: Int) -> BroPrefix []
 // code.
 pub fn read_complex(src: Bytes, at_bit: Int,
                     alphabet_size: Int) -> Result<BroPrefix, brotlierror.BroFault> []
-    todo("brotli-nv.brotliprefix.read_complex")
+    var r = brotlistream.reader(src, at_bit)
+    let start = r.pos
+    let hskip = brotlistream.read_bits(var r, 2)
+    read_complex_from(var r, alphabet_size, hskip, start)
 
 // Read whichever shape is there.
 //
@@ -120,11 +354,12 @@ pub fn read_complex(src: Bytes, at_bit: Int,
 // to see which it was.
 pub fn read(src: Bytes, at_bit: Int,
             alphabet_size: Int) -> Result<BroPrefix, brotlierror.BroFault> []
-    todo("brotli-nv.brotliprefix.read")
+    var r = brotlistream.reader(src, at_bit)
+    read_from(var r, alphabet_size)
 
 // How many BITS a code occupied, so the caller can advance.
 pub fn code_bits(p: BroPrefix) -> Int []
-    todo("brotli-nv.brotliprefix.code_bits")
+    p.bits
 
 // ── The code-length alphabet ─────────────────────────────────────────
 
@@ -136,7 +371,7 @@ pub fn code_bits(p: BroPrefix) -> Int []
 // because it is a table a reader has to have exactly right and cannot
 // derive, and because a test can compare it against RFC 7932 § 3.5.
 pub fn code_length_order() -> [Int] []
-    todo("brotli-nv.brotliprefix.code_length_order")
+    [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 // The two repeat symbols of the code-length alphabet: 16 and 17.
 //
@@ -146,11 +381,16 @@ pub fn code_length_order() -> [Int] []
 // run.  The pair is published because that accumulation is the part a
 // hand-written decoder gets wrong.
 pub fn repeat_symbols() -> [Int] []
-    todo("brotli-nv.brotliprefix.repeat_symbols")
+    [16, 17]
 
 // How many extra bits a repeat symbol carries: 2 for 16, 3 for 17.
 pub fn repeat_extra_bits(symbol: Int) -> Int []
-    todo("brotli-nv.brotliprefix.repeat_extra_bits")
+    if symbol == 16
+        2
+    elif symbol == 17
+        3
+    else
+        0
 
 // ── Reading a code, and checking one ─────────────────────────────────
 
@@ -161,7 +401,9 @@ pub fn repeat_extra_bits(symbol: Int) -> Int []
 // returned once per symbol of the whole stream and a boxed value there
 // would be the decode's dominant cost.
 pub fn decode_symbol(p: BroPrefix, src: Bytes, at_bit: Int) -> [Int] []
-    todo("brotli-nv.brotliprefix.decode_symbol")
+    var r = brotlistream.reader(src, at_bit)
+    let sym = decode_with(table_of(p), var r)
+    [sym, r.pos - at_bit]
 
 // The Kraft sum of a code's lengths, scaled to 32768.
 //
@@ -169,11 +411,15 @@ pub fn decode_symbol(p: BroPrefix, src: Bytes, at_bit: Int) -> [Int] []
 // Published so a caller can check a code it built itself — an encoder
 // does exactly that before it writes one.
 pub fn kraft_sum(lengths: [Int]) -> Int []
-    todo("brotli-nv.brotliprefix.kraft_sum")
+    var total = 0
+    for l in lengths
+        if l >= 1 and l <= 15
+            total = total + (32768 >> l)
+    total
 
 // Whether the lengths form a complete prefix code.
 pub fn is_complete(lengths: [Int]) -> Bool []
-    todo("brotli-nv.brotliprefix.is_complete")
+    kraft_sum(lengths) == 32768
 
 // Whether the code always answers one symbol, consuming no bits.
 //
@@ -182,19 +428,96 @@ pub fn is_complete(lengths: [Int]) -> Bool []
 // completeness rejects it, and a caller that saw only "incomplete"
 // could not tell the two apart.
 pub fn is_single_symbol(p: BroPrefix) -> Bool []
-    todo("brotli-nv.brotliprefix.is_single_symbol")
+    p.single >= 0
 
 // How many symbols the code can answer.
 pub fn live_symbols(p: BroPrefix) -> Int []
-    todo("brotli-nv.brotliprefix.live_symbols")
+    p.live
 
 // The code's lengths, for a caller re-encoding or reporting.
 pub fn lengths_of(p: BroPrefix) -> [Int] []
-    todo("brotli-nv.brotliprefix.lengths_of")
+    p.lengths[:]
 
 // A prefix code built from lengths the caller has.
 //
 // The encoder's half, and what makes `kraft_sum` testable against a
 // code this package produced rather than only against one it read.
 pub fn of_lengths(lengths: [Int]) -> Result<BroPrefix, brotlierror.BroFault> []
-    todo("brotli-nv.brotliprefix.of_lengths")
+    prefix_of_lengths(lengths, 0)
+
+// ── Decoding with a table ────────────────────────────────────────────
+
+// The decoding table of a prefix code.
+//
+// ```novo
+// use brotliprefix
+//
+// fn main() [io]
+//     match brotliprefix.of_lengths([1, 2, 2])
+//         Ok(p) => println("${brotliprefix.table_of(p).symbols}")   // [0, 1, 2]
+//         Err(_) => println("refused")
+// ```
+pub fn table_of(p: BroPrefix) -> BroTable []
+    var counts = list.zeros(16)
+    var symbols = [] as [Int]
+    if p.single >= 0
+        BroTable { counts: counts, symbols: symbols, single: p.single }
+    else
+        for l in p.lengths
+            if l > 0
+                counts[l] = counts[l] + 1
+        for len in 1..16
+            for i in 0..list.len(p.lengths)
+                if p.lengths[i] == len
+                    symbols = list.push(symbols, i)
+        BroTable { counts: counts, symbols: symbols, single: 0 - 1 }
+
+// The next symbol of a table, read from the cursor.
+//
+// Prefix codes are packed starting from the first bit of the code, so
+// the bits are taken one at a time and compared against the canonical
+// ranges of each length.  A code of one symbol answers without reading.
+//
+// ```novo
+// use std.bytes
+// use brotliprefix
+// use brotlistream
+//
+// fn main() [io]
+//     match brotliprefix.of_lengths([1, 2, 2])
+//         Ok(p) =>
+//             var r = brotlistream.reader(bytes.from_byte_list([1]), 0)
+//             println("${brotliprefix.decode_with(brotliprefix.table_of(p), var r)}")   // 2
+//         Err(_) => println("refused")
+// ```
+pub fn decode_with(t: BroTable, var r: BroReader) -> Int []
+    if t.single >= 0
+        t.single
+    else
+        let v = brotlistream.peek_bits(r, 15)
+        var code = 0
+        var first = 0
+        var index = 0
+        var len = 1
+        var sym = 0
+        var found = false
+        while len <= 15 and not found
+            code = code | ((v >> (len - 1)) & 1)
+            let count = t.counts[len]
+            if code - count < first
+                sym = t.symbols[index + code - first]
+                found = true
+            else
+                index = index + count
+                first = (first + count) << 1
+                code = code << 1
+                len = len + 1
+        brotlistream.skip_bits(var r, (if found then len else 15))
+        sym
+
+// Read whichever shape of code is at the cursor, advancing past it.
+//
+// The call the decoder makes, so that one reader serves a whole
+// meta-block.
+pub fn read_code(var r: BroReader, alphabet_size: Int) -> Result<BroPrefix, BroFault> []
+    read_from(var r, alphabet_size)

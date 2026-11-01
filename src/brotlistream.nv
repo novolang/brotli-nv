@@ -1,8 +1,6 @@
 // brotlistream.nv — the first few bits: how big a window the stream
 // wants, and whether the caller will give it one.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE WINDOW IS THE CALLER'S BUDGET, WHICH IS THE ONE DECISION IN THIS
 // MODULE.  A Brotli stream opens with a variable-length `WBITS` field
 // that asks for a sliding window of up to 16 MiB — and up to a
@@ -24,7 +22,177 @@
 // name; the real answer comes from the `Content-Encoding` header, and
 // that is why `content_encoding_token` is published here.
 
+use std.bytes
 use brotlierror
+
+// ── Internals ────────────────────────────────────────────────────────
+
+// The 32 bits at byte `byte`, with bytes past the end read as zero.
+fn gather(src: Bytes, byte: Int) -> Int
+    (bytes.byte_at(src, byte) ?? 0) | ((bytes.byte_at(src, byte + 1) ?? 0) << 8)
+        | ((bytes.byte_at(src, byte + 2) ?? 0) << 16) | ((bytes.byte_at(src, byte + 3) ?? 0) << 24)
+
+// The window bits field, RFC 7932 section 9.1: one bit for 16, otherwise
+// three bits for 18 to 24, otherwise three more for 17 and 10 to 15.
+// Answers the negated field when the encoding is the reserved one (the
+// large-window extension's, which this package does not accept), and
+// sets `over` when the stream ends inside the field.
+fn read_window_bits(var r: BroReader) -> Int
+    if read_bits(var r, 1) == 0
+        16
+    else
+        let n = read_bits(var r, 3)
+        if n != 0
+            17 + n
+        else
+            let m = read_bits(var r, 3)
+            if m == 0
+                17
+            elif m == 1
+                0 - 1
+            else
+                8 + m
+
+// Whether the first bytes are another format's signature: gzip, zip
+// or zstd.
+fn has_other_magic(src: Bytes) -> Bool
+    let b0 = bytes.byte_at(src, 0) ?? 0
+    let b1 = bytes.byte_at(src, 1) ?? 0
+    b0 == 31 and b1 == 139 or b0 == 80 and b1 == 75 or b0 == 40 and b1 == 181
+
+// Whether the first sixteen bytes are all printable ASCII or white
+// space, which a compressed stream of that length almost never is.
+fn is_plain_text(src: Bytes) -> Bool
+    let n = if bytes.len(src) < 16
+        bytes.len(src)
+    else
+        16
+    var text = n >= 8
+    for i in 0..n
+        let c = bytes.byte_at(src, i) ?? 0
+        if not (c == 9 or c == 10 or c == 13 or c >= 32 and c < 127)
+            text = false
+    text
+
+// Whether the window field is valid and the first meta-block header
+// does not contradict itself.
+fn plausible_head(src: Bytes) -> Bool
+    var r = reader(src, 0)
+    let wbits = read_window_bits(var r)
+    if wbits < 0
+        false
+    else
+        let last = read_bits(var r, 1)
+        let empty = if last == 1
+            read_bits(var r, 1)
+        else
+            0
+        if empty == 1
+            bits_left(r) < 8
+        else
+            let nibbles = read_bits(var r, 2)
+            nibbles != 3 or read_bits(var r, 1) == 0
+
+// ── The bit reader ───────────────────────────────────────────────────
+
+// A cursor over a byte buffer that is read a bit at a time, least
+// significant bit first, which is the order every field of the format
+// is packed in.
+//
+// A read past the end does not fail on the spot.  It answers zeros and
+// sets `over`, so a parser can read a whole item without a check after
+// every field and look at `over` once at the end.  A parser that finds
+// it set discards what it read and waits for more input, which is how
+// the decoder resumes at a byte boundary of the caller's choosing.
+pub struct BroReader
+    // The bytes being read.
+    src: Bytes
+    // The next bit to read, counted from the first bit of `src`.
+    var pos: Int
+    // How many bits `src` holds.
+    end: Int
+    // Whether a read went past `end`.
+    var over: Bool
+
+// A reader at bit `at_bit` of `src`.
+//
+// ```novo
+// use std.bytes
+// use brotlistream
+//
+// fn main() [io]
+//     var r = brotlistream.reader(bytes.from_byte_list([5]), 0)
+//     println("${brotlistream.read_bits(var r, 3)}")   // 5
+// ```
+pub fn reader(src: Bytes, at_bit: Int) -> BroReader []
+    BroReader { src: src, pos: at_bit, end: bytes.len(src) * 8, over: false }
+
+// The next `n` bits, 0 to 24, without moving the cursor.  Bits past the
+// end read as zero.
+//
+// ```novo
+// use std.bytes
+// use brotlistream
+//
+// fn main() [io]
+//     let r = brotlistream.reader(bytes.from_byte_list([255, 1]), 4)
+//     println("${brotlistream.peek_bits(r, 8)}")   // 31
+// ```
+pub fn peek_bits(r: BroReader, n: Int) -> Int []
+    let byte = r.pos >>> 3
+    let sh = r.pos & 7
+    let word = match bytes.u32_le_at(r.src, byte)
+        Some(v) => v
+        None    => gather(r.src, byte)
+    (word >>> sh) & ((1 << n) - 1)
+
+// The next `n` bits, 0 to 24, and the cursor moved past them.  Reading
+// past the end sets `over`.
+//
+// ```novo
+// use std.bytes
+// use brotlistream
+//
+// fn main() [io]
+//     var r = brotlistream.reader(bytes.from_byte_list([255]), 0)
+//     println("${brotlistream.read_bits(var r, 4)} ${brotlistream.read_bits(var r, 4)}")   // 15 15
+// ```
+pub fn read_bits(var r: BroReader, n: Int) -> Int []
+    let v = peek_bits(r, n)
+    skip_bits(var r, n)
+    v
+
+// The cursor moved forward `n` bits.  Moving past the end sets `over`.
+pub fn skip_bits(var r: BroReader, n: Int) []
+    r.pos = r.pos + n
+    if r.pos > r.end
+        r.over = true
+
+// How many bits are left before the end.
+pub fn bits_left(r: BroReader) -> Int []
+    if r.pos >= r.end
+        0
+    else
+        r.end - r.pos
+
+// Move the cursor to the next byte boundary.  Answers whether the bits
+// it skipped were all zero, which the format requires of the padding
+// before a stored or metadata payload.
+//
+// ```novo
+// use std.bytes
+// use brotlistream
+//
+// fn main() [io]
+//     var r = brotlistream.reader(bytes.from_byte_list([1, 2]), 0)
+//     brotlistream.skip_bits(var r, 3)
+//     println("${brotlistream.align(var r)}")   // true
+// ```
+pub fn align(var r: BroReader) -> Bool []
+    let pad = (8 - (r.pos & 7)) & 7
+    let v = peek_bits(r, pad)
+    skip_bits(var r, pad)
+    v == 0
 
 // What the caller allows a stream to ask for.
 //
@@ -71,15 +239,15 @@ pub struct BroHeader
 // decompressing request bodies should lower both, and the fact that it
 // has to say so is the point.
 pub fn default_limits() -> BroLimits []
-    todo("brotli-nv.brotlistream.default_limits")
+    BroLimits { max_window: 16777200, max_output: 0 }
 
 // A budget for a caller that knows its inputs are small.
 //
-// A 64 KiB window and a 16 MiB output bound — the shape an HTTP server
+// A 4 MiB window and a 16 MiB output bound — the shape an HTTP server
 // accepting compressed request bodies wants, where the client chooses
 // the bytes and the server chooses the ceiling.
 pub fn small_limits() -> BroLimits []
-    todo("brotli-nv.brotlistream.small_limits")
+    BroLimits { max_window: 4194304, max_output: 16777216 }
 
 // Parse the stream header.
 //
@@ -87,13 +255,30 @@ pub fn small_limits() -> BroLimits []
 // encoding; `BroWindowTooLarge` carrying both numbers when the window
 // the header asks for is past the budget.
 //
-// ```novo ignore
-// match brotlistream.parse_header(compressed, brotlistream.small_limits())
-//     Ok(h)  => println("${h.window_size} byte window")
-//     Err(e) => println(e.message())
+// ```novo
+// use brotlistream
+//
+// fn main() [io]
+//     match brotlistream.parse_header(brotlistream.empty_stream(), brotlistream.small_limits())
+//         Ok(h) => println("${h.window_size} byte window")
+//         Err(e) => println(e.message())
 // ```
 pub fn parse_header(src: Bytes, limits: BroLimits) -> Result<BroHeader, brotlierror.BroFault> []
-    todo("brotli-nv.brotlistream.parse_header")
+    var r = reader(src, 0)
+    let wbits = read_window_bits(var r)
+    if r.over
+        Err(BroTruncated(0, 1 - bits_left(r)))
+    elif wbits < 0
+        Err(BroBadWindowBits(0 - wbits))
+    else
+        let size = window_size_of(wbits)
+        if size > limits.max_window
+            Err(BroWindowTooLarge(size, limits.max_window))
+        else
+            Ok(BroHeader { window_bits: wbits,
+                window_size: size,
+                large_window: false,
+                header_bits: r.pos })
 
 // The window size a `WBITS` value names: `(1 << bits) - 16`.
 //
@@ -101,12 +286,12 @@ pub fn parse_header(src: Bytes, limits: BroLimits) -> Result<BroHeader, brotlier
 // buffer does before it decides whether to decode at all, and because
 // the sixteen is the number everyone gets wrong.
 pub fn window_size_of(bits: Int) -> Int []
-    todo("brotli-nv.brotlistream.window_size_of")
+    (1 << bits) - 16
 
 // The smallest and largest `WBITS` the base format allows, as a pair:
 // 10 and 24.
 pub fn window_bits_range() -> [Int] []
-    todo("brotli-nv.brotlistream.window_bits_range")
+    [10, 24]
 
 // The largest `WBITS` the large-window extension allows: 30.
 //
@@ -114,11 +299,11 @@ pub fn window_bits_range() -> [Int] []
 // using it is not RFC 7932, and a caller that accepted one without
 // deciding to would be accepting a gigabyte window from a header.
 pub fn large_window_max_bits() -> Int []
-    todo("brotli-nv.brotlistream.large_window_max_bits")
+    30
 
 // Whether a header would fit a budget, without parsing anything else.
 pub fn fits(h: BroHeader, limits: BroLimits) -> Bool []
-    todo("brotli-nv.brotlistream.fits")
+    h.window_size <= limits.max_window
 
 // ── What a caller outside this package needs to know ─────────────────
 
@@ -131,7 +316,7 @@ pub fn fits(h: BroHeader, limits: BroLimits) -> Bool []
 // in every codec.  So the spelling is published here, where the format
 // is, and a header writer compares against it.
 pub fn content_encoding_token() -> Str []
-    todo("brotli-nv.brotlistream.content_encoding_token")
+    "br"
 
 // Whether a buffer might be a Brotli stream.
 //
@@ -144,7 +329,10 @@ pub fn content_encoding_token() -> Str []
 // Published anyway because a caller with a file and no header will
 // write a worse version of it otherwise.
 pub fn looks_like_brotli(src: Bytes) -> Bool []
-    todo("brotli-nv.brotlistream.looks_like_brotli")
+    if bytes.len(src) == 0 or has_other_magic(src) or is_plain_text(src)
+        false
+    else
+        plausible_head(src)
 
 // The empty stream: the shortest byte sequence that decodes to nothing.
 //
@@ -152,4 +340,4 @@ pub fn looks_like_brotli(src: Bytes) -> Bool []
 // for empty input and what a decoder must accept, and because a test
 // that has one round-trip vector should have this one.
 pub fn empty_stream() -> Bytes []
-    todo("brotli-nv.brotlistream.empty_stream")
+    bytes.from_byte_list([59])
