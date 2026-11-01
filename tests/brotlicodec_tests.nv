@@ -1,9 +1,6 @@
 // brotlicodec_tests.nv — the decoder's loop and the encoder's declared
 // scope, reached with the types the package itself produces.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
-//
 // THE TWO ASSERTIONS THIS SUITE EXISTS FOR:
 //
 //   `BroNeedMore` and `BroWantsDrain` are DIFFERENT answers, and the
@@ -41,26 +38,27 @@ fn test_the_two_ways_to_be_hungry_are_two_different_answers() [io]
         Ok(d0) =>
             test.case("THE CLAIM: a fresh decoder has produced nothing and failed at nothing")
             test.assert(brotlidec.produced(d0) == 0)
-            test.assert(brotlidec.is_done(d0) == false)
-            test.assert(brotlidec.is_failed(d0) == false)
+            test.assert(not brotlidec.is_done(d0))
+            test.assert(not brotlidec.is_failed(d0))
             test.assert(brotlidec.fault_of(d0) == None)
 
             test.case("its memory is the WINDOW, which the caller's budget bounded")
             test.assert(brotlidec.window_bytes(d0) <= brotlistream.small_limits().max_window)
 
             test.case("feeding does not make the decoder keep the chunk")
-            match brotlidec.feed(d0, stub())
+            var live = d0
+            match brotlidec.feed(var live, stub())
                 Err(_) => test.assert(false)
                 Ok(d1) =>
                     test.assert(brotlidec.pending_input(d1) < 64)
 
                     test.case("and a step says WHICH of the two things the caller must do")
-                    let out = bytes.from_byte_list([0, 0, 0, 0])
-                    match brotlidec.step(d1, out, 0)
+                    var out = bytes.from_byte_list([0, 0, 0, 0])
+                    match brotlidec.step(var live, var out, 0)
                         BroProduced(n) => test.assert(n >= 0)
                         BroNeedMore    => test.assert(true)
                         BroWantsDrain  => test.assert(true)
-                        BroDone        => test.assert(brotlidec.is_done(brotlidec.advanced(d1)))
+                        BroDone        => test.assert(brotlidec.is_done(brotlidec.advanced(live)))
 
 @test
 fn test_the_whole_stream_form_has_no_unbounded_twin() [io]
@@ -80,7 +78,7 @@ fn test_the_whole_stream_form_has_no_unbounded_twin() [io]
 
     test.case("and the two budget faults are separated from the eleven that mean bad bytes")
     test.assert(brotlierror.is_budget(BroOutputFull(4)))
-    test.assert(brotlierror.is_budget(BroTruncated(17, 8)) == false)
+    test.assert(not brotlierror.is_budget(BroTruncated(17, 8)))
 
 @test
 fn test_what_the_encoder_does_not_do_is_a_value_and_not_a_paragraph() [io]
@@ -92,13 +90,13 @@ fn test_what_the_encoder_does_not_do_is_a_value_and_not_a_paragraph() [io]
 
     test.case("so a level outside the declared range is refused by name")
     test.assert(brotlienc.supports_quality(4))
-    test.assert(brotlienc.supports_quality(9) == false)
+    test.assert(not brotlienc.supports_quality(9))
 
     test.case("block splitting is most of the difference, and is absent by assertion")
-    test.assert(brotlienc.splits_blocks() == false)
+    test.assert(not brotlienc.splits_blocks())
 
     test.case("and so is the custom-dictionary extension, which is a row of its own")
-    test.assert(brotlienc.supports_custom_dictionary() == false)
+    test.assert(not brotlienc.supports_custom_dictionary())
 
 @test
 fn test_the_encoder_picks_a_window_a_decoder_will_not_resent() [io]
@@ -143,11 +141,12 @@ fn test_an_encoder_carries_its_settings_flat_and_hands_the_value_back() [io]
             test.assert(brotlienc.emitted(e) == 0)
 
             test.case("writing and finishing are separate, because an unfinished stream is INVALID")
-            let out = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0])
-            match brotlienc.write(e, bytes.from_str("hi"), out, 0)
+            var out = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0])
+            var live = e
+            match brotlienc.write(var live, bytes.from_str("hi"), var out, 0)
                 Err(_) => test.assert(false)
                 Ok(n)  => test.assert(n >= 0)
-            match brotlienc.finish(brotlienc.advanced(e), out, 0)
+            match brotlienc.finish(var live, var out, 0)
                 Err(_) => test.assert(false)
                 Ok(n)  => test.assert(n >= 0)
 
@@ -180,7 +179,7 @@ fn test_the_headers_parse_from_bytes_and_answer_where_the_payload_begins() [io]
 @test
 fn test_a_prefix_code_is_read_in_whichever_shape_the_stream_wrote_it() [io]
     test.case("THE CLAIM: the two bits at the head decide, and the dispatch is published")
-    test.assert(brotliprefix.is_simple_at(stub(), 0) == false)
+    test.assert(not brotliprefix.is_simple_at(stub(), 0))
 
     test.case("a simple code lists its symbols outright")
     match brotliprefix.read_simple(stub(), 0, 256)
@@ -216,4 +215,4 @@ fn test_the_map_and_the_dictionary_are_reached_by_the_calls_the_decoder_makes() 
 
     test.case("the distance a code names is available without building a reference")
     test.assert(brotlidist.distance_of(brotlidist.default_params(),
-                                       brotlidist.initial_cache(), 0, 0) == 16)
+                                       brotlidist.initial_cache(), 0, 0) == 4)

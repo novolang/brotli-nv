@@ -1,9 +1,6 @@
 // brotlistream_tests.nv — the window is the caller's budget, and the
 // dictionary is the size it is.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
-//
 // THE TWO ASSERTIONS THIS SUITE EXISTS FOR:
 //
 //   a header that asks for a window the caller did not budget for is
@@ -59,7 +56,7 @@ fn test_a_window_past_the_budget_is_refused_before_anything_is_allocated() [io]
     let h = BroHeader { window_bits: 24, window_size: 16777200, large_window: false,
                         header_bits: 5 }
     test.assert(brotlistream.fits(h, big))
-    test.assert(brotlistream.fits(h, small) == false)
+    test.assert(not brotlistream.fits(h, small))
     test.assert(brotlierror.is_budget(BroWindowTooLarge(16777200, 65536)))
 
     test.case("which is a refusal rather than an allocator failure with a stranger's number")
@@ -68,8 +65,8 @@ fn test_a_window_past_the_budget_is_refused_before_anything_is_allocated() [io]
 @test
 fn test_there_is_no_magic_number_and_the_heuristic_says_so_in_its_name() [io]
     test.case("THE CLAIM: the first bits ARE the window field, so nothing identifies a stream")
-    test.assert(brotlistream.looks_like_brotli(bytes.from_byte_list([31, 139, 8])) == false)
-    test.assert(brotlistream.looks_like_brotli(bytes.from_str("PK\u{3}\u{4}")) == false)
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_byte_list([31, 139, 8])))
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_str("PK\u{3}\u{4}")))
 
     test.case("the real answer is the Content-Encoding header, whose token is published here")
     test.assert(brotlistream.content_encoding_token() == "br")
@@ -83,7 +80,7 @@ fn test_the_empty_stream_is_one_byte_and_the_format_has_no_checksum() [io]
     test.assert(bytes.len(brotlistream.empty_stream()) == 1)
 
     test.case("and there is NO integrity check of any kind, unlike gzip's CRC32")
-    test.assert(brotlidec.has_checksum() == false)
+    test.assert(not brotlidec.has_checksum())
 
     test.case("so a structurally valid stream is accepted whatever it decodes to")
     match brotlidec.decompress(brotlistream.empty_stream(), brotlistream.small_limits())
@@ -121,7 +118,7 @@ fn test_a_transform_is_a_prefix_an_operation_and_a_suffix() [io]
 
     test.case("and the identity is transform 0, which is the encoder's cheapest reference")
     test.assert(brotlidict.identity_id() == 0)
-    test.assert(brotlidict.transform_changes_word(0) == false)
+    test.assert(not brotlidict.transform_changes_word(0))
 
     test.case("a transform past the table is refused by name")
     match brotlidict.transform(200)
@@ -144,12 +141,12 @@ fn test_the_transformed_length_is_not_the_word_length() [io]
 fn test_a_word_out_of_range_is_refused_before_the_data_is_touched() [io]
     test.case("THE CLAIM: the bound check is what stops a corrupt stream reading past the end")
     test.assert(brotlidict.word_exists(4, 0))
-    test.assert(brotlidict.word_exists(3, 0) == false)
-    test.assert(brotlidict.word_exists(4, 999999) == false)
+    test.assert(not brotlidict.word_exists(3, 0))
+    test.assert(not brotlidict.word_exists(4, 999999))
 
     match brotlidict.word(3, 0)
         Ok(_)  => test.assert(false)
-        Err(e) => test.assert(brotlierror.is_budget(e) == false)
+        Err(e) => test.assert(not brotlierror.is_budget(e))
 
     test.case("and the offset table is published, so a caller can serve the data from flash")
     test.assert(brotlidict.offset_of_length(4) == 0)

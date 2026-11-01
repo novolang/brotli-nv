@@ -1,0 +1,178 @@
+// brotli_crafted_tests.nv — streams built bit by bit to reach what the
+// compressors never write: block types and block switching for each of
+// the three categories, metadata and stored meta-blocks, and every way a
+// header or a prefix code or a distance can be wrong.
+//
+// A small bit packer in Python made them, and the reference decoder
+// (libbrotli) decoded each valid one to the bytes pinned here and refused
+// each invalid one.  The refusals pinned here are this package's own
+// words for what it found.
+
+use std.bytes
+use std.list
+use std.test
+use brotlidec
+use brotlistream
+
+fn unhex(h: Str) -> Bytes
+    bytes.from_hex(h) ?? bytes.zeros(0)
+
+fn roomy() -> BroLimits
+    BroLimits { max_window: 16777200, max_output: 0 }
+
+fn refusal(h: Str) -> Str
+    match brotlidec.decompress(unhex(h), roomy())
+        Ok(_)  => "accepted"
+        Err(e) => e.message()
+
+fn streamed(src: Bytes) -> Str
+    match brotlidec.decoder(bytes.zeros(0), roomy())
+        Err(e) => e.message()
+        Ok(d0) =>
+            var d = d0
+            var out = bytes.zeros(1)
+            var got = [] as [Bytes]
+            var fed = 0
+            var going = true
+            while going
+                match brotlidec.step(var d, var out, 0)
+                    BroProduced(n) =>
+                        got = list.push(got, bytes.slice(out, 0, n))
+                    BroDone        =>
+                        going = false
+                    BroWantsDrain  =>
+                        going = false
+                    BroNeedMore    =>
+                        if fed >= bytes.len(src)
+                            going = false
+                        else
+                            match brotlidec.feed(var d, bytes.slice(src, fed, fed + 1))
+                                Ok(_)  =>
+                                    fed = fed + 1
+                                Err(_) =>
+                                    going = false
+            match brotlidec.fault_of(d)
+                Some(f) => f.message()
+                None    => bytes.to_hex(bytes.concat(got))
+
+@test
+fn test_streams_built_by_hand_decode_to_what_the_reference_says() [io]
+    test.case("literal_block_types")
+    match brotlidec.decompress(unhex("2201208a020800a10400000000000000f8ffffffffffffffa7c2c40a2f2f040a00dd58"), roomy())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "61626178797978626162")
+        Err(e) => test.fail(e.message())
+    test.assert_eq(streamed(unhex("2201208a020800a10400000000000000f8ffffffffffffffa7c2c40a2f2f040a00dd58")),
+        "61626178797978626162")
+
+    test.case("command_and_distance_block_types")
+    match brotlidec.decompress(unhex("2204401405288a02002094f0222c448951028a484f"), roomy())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "61616161616161616161616161616161616161616161616161616161616161616161")
+        Err(e) => test.fail(e.message())
+    test.assert_eq(streamed(unhex("2204401405288a02002094f0222c448951028a484f")),
+        "61616161616161616161616161616161616161616161616161616161616161616161")
+
+    test.case("metadata_skipped")
+    match brotlidec.decompress(unhex("2c02787878787871000000222c440908"), roomy())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "6161616161616161")
+        Err(e) => test.fail(e.message())
+    test.assert_eq(streamed(unhex("2c02787878787871000000222c440908")), "6161616161616161")
+
+    test.case("stored_block")
+    match brotlidec.decompress(unhex("40001068656c6c6f03"), roomy())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "68656c6c6f")
+        Err(e) => test.fail(e.message())
+    test.assert_eq(streamed(unhex("40001068656c6c6f03")), "68656c6c6f")
+
+    test.case("empty_metadata")
+    match brotlidec.decompress(unhex("0c03"), roomy())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "")
+        Err(e) => test.fail(e.message())
+    test.assert_eq(streamed(unhex("0c03")), "")
+
+@test
+fn test_each_way_a_stream_can_be_wrong_is_named() [io]
+    test.case("metadata_reserved_bit")
+    test.assert_eq(refusal("1c"), "brotli: the meta-block header at byte 0 has a bad reserved bit")
+    test.assert_eq(streamed(unhex("1c")), "brotli: the meta-block header at byte 0 has a bad reserved bit")
+
+    test.case("metadata_length_zero_top")
+    test.assert_eq(refusal("cc00000000000000000000"),
+        "brotli: the meta-block header at byte 0 has a bad metadata length")
+    test.assert_eq(streamed(unhex("cc00000000000000000000")),
+        "brotli: the meta-block header at byte 0 has a bad metadata length")
+
+    test.case("length_top_nibble_zero")
+    test.assert_eq(refusal("f4ff0f000000000000000000"),
+        "brotli: the meta-block header at byte 0 has a bad length")
+    test.assert_eq(streamed(unhex("f4ff0f000000000000000000")),
+        "brotli: the meta-block header at byte 0 has a bad length")
+
+    test.case("metadata_padding")
+    test.assert_eq(refusal("8c0000000000000000"), "brotli: the meta-block header at byte 1 has a bad padding")
+    test.assert_eq(streamed(unhex("8c0000000000000000")),
+        "brotli: the meta-block header at byte 1 has a bad padding")
+
+    test.case("stored_padding")
+    test.assert_eq(refusal("40003068656c6c6f03"), "brotli: the meta-block header at byte 3 has a bad padding")
+    test.assert_eq(streamed(unhex("40003068656c6c6f03")),
+        "brotli: the meta-block header at byte 3 has a bad padding")
+
+    test.case("simple_code_duplicate")
+    test.assert_eq(refusal("e2000000545858881210"),
+        "brotli: the simple prefix code at byte 4 is invalid (2 symbols)")
+    test.assert_eq(streamed(unhex("e2000000545858881210")),
+        "brotli: the simple prefix code at byte 4 is invalid (2 symbols)")
+
+    test.case("simple_code_symbol_past_alphabet")
+    test.assert_eq(refusal("e20000004458801c10"),
+        "brotli: the simple prefix code at byte 6 is invalid (1 symbols)")
+    test.assert_eq(streamed(unhex("e20000004458801c10")),
+        "brotli: the simple prefix code at byte 6 is invalid (1 symbols)")
+
+    test.case("complex_code_incomplete")
+    test.assert_eq(refusal("e2000000b00100000084280101"),
+        "brotli: the prefix code at byte 9 is not complete, its Kraft sum is 16384 of 32768")
+    test.assert_eq(streamed(unhex("e2000000b00100000084280101")),
+        "brotli: the prefix code at byte 9 is not complete, its Kraft sum is 16384 of 32768")
+
+    test.case("complex_code_repeat_past_alphabet")
+    test.assert_eq(refusal("e200000000308eb97b881210"),
+        "brotli: the prefix code at byte 4 is not complete, its Kraft sum is 0 of 32768")
+    test.assert_eq(streamed(unhex("e200000000308eb97b881210")),
+        "brotli: the prefix code at byte 4 is not complete, its Kraft sum is 0 of 32768")
+
+    test.case("context_map_run_overrun")
+    test.assert_eq(refusal("e2000000b1c201"), "brotli: the context map at byte 4 is invalid (size 64)")
+    test.assert_eq(streamed(unhex("e2000000b1c201")), "brotli: the context map at byte 4 is invalid (size 64)")
+
+    test.case("copy_past_block_length")
+    test.assert_eq(refusal("a20000004458881210"), "brotli: the meta-block declares 2 bytes and produced 4")
+    test.assert_eq(streamed(unhex("a20000004458881210")),
+        "brotli: the meta-block declares 2 bytes and produced 4")
+
+    test.case("distance_not_positive")
+    test.assert_eq(refusal("e2010000445888520614"),
+        "brotli: distance -1 reaches neither the 12 bytes produced nor a dictionary word")
+    test.assert_eq(streamed(unhex("e2010000445888520614")),
+        "brotli: distance -1 reaches neither the 12 bytes produced nor a dictionary word")
+
+    test.case("dictionary_transform_past_table")
+    test.assert_eq(refusal("2201000044588812300000"),
+        "brotli: distance 262141 reaches neither the 4 bytes produced nor a dictionary word")
+    test.assert_eq(streamed(unhex("2201000044588812300000")),
+        "brotli: distance 262141 reaches neither the 4 bytes produced nor a dictionary word")
+
+    test.case("dictionary_copy_length_two")
+    test.assert_eq(refusal("2201000044588012300000"),
+        "brotli: distance 262141 reaches neither the 4 bytes produced nor a dictionary word")
+    test.assert_eq(streamed(unhex("2201000044588012300000")),
+        "brotli: distance 262141 reaches neither the 4 bytes produced nor a dictionary word")
+
+    test.case("dictionary_word_past_block_length")
+    test.assert_eq(refusal("2201000044588812240201"), "brotli: the meta-block declares 6 bytes and produced 9")
+    test.assert_eq(streamed(unhex("2201000044588812240201")),
+        "brotli: the meta-block declares 6 bytes and produced 9")
+
+    test.case("reserved_window_bits")
+    test.assert_eq(refusal("9101"), "brotli: the window bits field 1 is not defined")
+    test.assert_eq(streamed(unhex("9101")), "brotli: the window bits field 1 is not defined")

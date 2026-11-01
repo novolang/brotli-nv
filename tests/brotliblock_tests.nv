@@ -1,9 +1,6 @@
 // brotliblock_tests.nv — meta-blocks, prefix codes, contexts, and the
 // four places a decoder goes silently wrong.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
-//
 // THE FOUR, EACH WITH ITS OWN ASSERTION BELOW:
 //
 //   a metadata meta-block's bytes are NOT output, and a decoder that
@@ -32,7 +29,7 @@ fn test_metadata_is_skipped_and_not_emitted() [io]
                                 is_last: false, header_bits: 20 }
 
     test.case("THE CLAIM: metadata produces NO output, however many bytes it covers")
-    test.assert(brotliblock.produces_output(meta) == false)
+    test.assert(not brotliblock.produces_output(meta))
     test.assert(meta.length == 0)
     test.assert(meta.skip_len == 32)
 
@@ -41,12 +38,12 @@ fn test_metadata_is_skipped_and_not_emitted() [io]
 
     test.case("and metadata is the second of two kinds whose payload is byte-aligned")
     test.assert(brotliblock.payload_is_aligned(meta))
-    test.assert(brotliblock.payload_is_aligned(data) == false)
+    test.assert(not brotliblock.payload_is_aligned(data))
 
     test.case("a last-empty block ends the stream and contributes nothing")
     let last = BroBlockHeader { kind: BroLastEmpty, length: 0, skip_len: 0,
                                 is_last: true, header_bits: 2 }
-    test.assert(brotliblock.produces_output(last) == false)
+    test.assert(not brotliblock.produces_output(last))
     test.assert(last.is_last)
 
 @test
@@ -77,7 +74,7 @@ fn test_the_previous_block_type_starts_at_one_and_not_at_zero() [io]
 
     test.case("the run counts down, and a switch is read when it reaches zero")
     test.assert(brotliblock.consume(s).remaining == 4)
-    test.assert(brotliblock.needs_switch(s) == false)
+    test.assert(not brotliblock.needs_switch(s))
     test.assert(brotliblock.needs_switch(BroBlockState { current: 0, previous: 1,
                                                          remaining: 0 }))
 
@@ -86,11 +83,11 @@ fn test_an_insert_and_copy_code_below_one_hundred_and_twenty_eight_carries_no_di
     test.case("THE CLAIM: it reuses d0, and a decoder that read a distance desynchronises")
     test.assert(brotliblock.uses_implicit_distance(0))
     test.assert(brotliblock.uses_implicit_distance(127))
-    test.assert(brotliblock.uses_implicit_distance(128) == false)
+    test.assert(not brotliblock.uses_implicit_distance(128))
 
     test.case("so the command carries the flag rather than leaving it to be re-derived")
     test.assert(brotliblock.command_of(10, 0, 0).implicit_distance)
-    test.assert(brotliblock.command_of(300, 0, 0).implicit_distance == false)
+    test.assert(not brotliblock.command_of(300, 0, 0).implicit_distance)
 
     test.case("the alphabet is 704 codes covering both lengths through a table of ranges")
     test.assert(brotliblock.command_alphabet_size() == 704)
@@ -103,12 +100,12 @@ fn test_an_insert_and_copy_code_below_one_hundred_and_twenty_eight_carries_no_di
 @test
 fn test_a_one_symbol_prefix_code_is_legal_and_is_not_complete() [io]
     test.case("THE CLAIM: it means that symbol always, consuming no bits")
-    let single = BroPrefix { lengths: [0], live: 1, single: 0 }
+    let single = BroPrefix { lengths: [0], live: 1, single: 0, bits: 0 }
     test.assert(brotliprefix.is_single_symbol(single))
 
     test.case("and its Kraft sum is not the complete one, so completeness alone rejects it")
     test.assert(brotliprefix.complete_sum() == 32768)
-    test.assert(brotliprefix.is_complete([0]) == false)
+    test.assert(not brotliprefix.is_complete([0]))
 
     test.case("a genuinely complete code sums to exactly that")
     test.assert(brotliprefix.kraft_sum([1, 1]) == 32768)
@@ -190,8 +187,9 @@ fn test_the_context_map_is_run_length_coded_with_an_inverse_move_to_front() [io]
     test.assert(brotlicontext.tree_for(m, 0, 17, 64) == 0)
 
     test.case("and the MTF pass is one bit whose absence produces a PERMUTATION of the map")
-    test.assert(m.used_mtf == false)
-    test.assert(brotlicontext.inverse_mtf([0, 1, 2]) != [0, 1, 2])
+    test.assert(not m.used_mtf)
+    test.assert(brotlicontext.inverse_mtf([1, 1, 0]) != [1, 1, 0])
+    test.assert(brotlicontext.inverse_mtf([1, 1, 0]) == [1, 0, 0])
     test.assert(list.len(brotlicontext.inverse_mtf([0, 1, 2])) == 3)
 
     test.case("which decodes to plausible bytes with no error anywhere")

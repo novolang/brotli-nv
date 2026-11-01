@@ -1,0 +1,372 @@
+// brotli_encoder_tests.nv — what the encoder writes, read back by this
+// package's decoder and, offline, by the reference decoder.
+//
+// The streams pinned by hex were checked against libbrotli's decoder when
+// they were pinned, so a change that alters the bytes without breaking the
+// round trip is still noticed.  Every other case is a round trip: whatever
+// goes in comes back out of `brotlidec`, at every quality the encoder
+// declares and at window sizes from the smallest to the default.
+
+use std.bytes
+use std.list
+use std.test
+use brotlidec
+use brotlidict
+use brotlienc
+use brotlistream
+
+const WORDS: [Str] = ["the",
+    "brotli",
+    "stream",
+    "of",
+    "compressed",
+    "bytes",
+    "<div>",
+    "</div>",
+    "window",
+    "dictionary",
+    "literal",
+    "insert",
+    "copy",
+    "distance",
+    "prefix",
+    "code"]
+
+fn step_lcg(x: Int) -> Int
+    (x * 1103515245 + 12345) & 2147483647
+
+fn gen_text(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var parts = [] as [Bytes]
+    var total = 0
+    while total < n
+        x = step_lcg(x)
+        var w = bytes.from_str(WORDS[(x >> 16) & 15] + " ")
+        parts = list.push(parts, w)
+        total = total + bytes.len(w)
+    bytes.slice(bytes.concat(parts), 0, n)
+
+fn gen_mixed(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var i = 0
+    var parts = [] as [Bytes]
+    var total = 0
+    while total < n
+        x = step_lcg(x)
+        i = i + 1
+        if i % 5 == 0
+            var chunk = [] as [Int]
+            for _ in 0..8
+                x = step_lcg(x)
+                chunk = list.push(chunk, (x >> 16) & 255)
+            parts = list.push(parts, bytes.from_byte_list(chunk))
+            total = total + 8
+        else
+            var w = bytes.from_str(WORDS[(x >> 16) & 15] + " ")
+            parts = list.push(parts, w)
+            total = total + bytes.len(w)
+    bytes.slice(bytes.concat(parts), 0, n)
+
+fn gen_random(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var out = [] as [Int]
+    for _ in 0..n
+        x = step_lcg(x)
+        out = list.push(out, (x >> 16) & 255)
+    bytes.from_byte_list(out)
+
+fn quality(level: Int, wbits: Int) -> BroQuality
+    BroQuality { level: level, window_bits: wbits, use_dictionary: true, text_hint: false }
+
+fn roomy() -> BroLimits
+    BroLimits { max_window: 16777200, max_output: 0 }
+
+// Compress and decompress, answering the bytes that came back or why not.
+fn round_trip(data: Bytes, q: BroQuality) -> Result<Bytes, Str>
+    match brotlienc.compress(data, q)
+        Err(e) => Err(e.message())
+        Ok(c)  =>
+            match brotlidec.decompress(c, roomy())
+                Err(e) => Err(e.message())
+                Ok(b)  => Ok(b)
+
+fn size_of(data: Bytes, q: BroQuality) -> Int
+    match brotlienc.compress(data, q)
+        Ok(c)  => bytes.len(c)
+        Err(_) => 0 - 1
+
+@test
+fn test_whatever_goes_in_comes_back_at_every_quality() [io]
+    let inputs = [bytes.zeros(0), bytes.from_str("a"), bytes.from_str("ab"), gen_text(100, 1),
+                  gen_text(5000, 2), gen_mixed(4000, 3), gen_random(3000, 4), bytes.zeros(40000)]
+    let names = ["empty", "one byte", "two bytes", "100 bytes of text", "5000 bytes of text",
+                 "text and binary", "random bytes", "zeros"]
+    for i in 0..list.len(inputs)
+        for level in 0..5
+            test.case("${names[i]} at quality ${level}")
+            match round_trip(inputs[i], quality(level, 22))
+                Ok(b)  => test.assert(b == inputs[i])
+                Err(e) => test.fail(e)
+
+@test
+fn test_every_window_size_is_written_and_read() [io]
+    let data = gen_text(3000, 5)
+    for wbits in 10..25
+        test.case("window bits ${wbits}")
+        match round_trip(data, quality(3, wbits))
+            Ok(b)  => test.assert(b == data)
+            Err(e) => test.fail(e)
+
+@test
+fn test_input_longer_than_one_meta_block_is_split_and_joined() [io]
+    let data = gen_mixed(300000, 6)
+    for level in [0, 2, 4]
+        test.case("300000 bytes at quality ${level}")
+        match round_trip(data, quality(level, 22))
+            Ok(b)  => test.assert(b == data)
+            Err(e) => test.fail(e)
+
+@test
+fn test_the_dictionary_flag_and_the_text_hint_are_carried() [io]
+    let data = gen_text(2000, 7)
+    test.case("the text hint changes the context mode and nothing the decoder cannot read")
+    let hinted = BroQuality { level: 4, window_bits: 22, use_dictionary: false, text_hint: true }
+    match round_trip(data, hinted)
+        Ok(b)  => test.assert(b == data)
+        Err(e) => test.fail(e)
+    test.assert(brotlienc.quality_of(match brotlienc.encoder(hinted)
+        Ok(e)  => e
+        Err(_) => brotlienc.encoder(quality(0, 22))!
+    ).text_hint)
+
+@test
+fn test_a_better_quality_is_not_larger_on_text() [io]
+    let data = gen_text(20000, 8)
+    let q0 = size_of(data, quality(0, 22))
+    let q4 = size_of(data, quality(4, 22))
+    test.assert(q0 > 0)
+    test.assert(q4 > 0)
+    test.assert(q4 <= q0)
+    test.assert(q4 * 2 < bytes.len(data))
+
+@test
+fn test_incompressible_data_costs_a_header_per_block_and_no_more() [io]
+    let data = gen_random(20000, 9)
+    let n = size_of(data, quality(4, 22))
+    test.assert(n > 20000)
+    test.assert(n <= brotlienc.max_compressed_size(20000))
+
+@test
+fn test_pinned_streams_the_reference_decoder_reads() [io]
+    let data = bytes.from_str("hello hello hello hello world")
+    test.case("quality 0 and quality 4 agree on a short repeat, and the bytes are pinned")
+    match brotlienc.compress(data, quality(0, 16))
+        Ok(c)  => test.assert_eq(bytes.to_hex(c), "820300004076acebfa775dd7759d1f0bc75859a1324f4861412e4b79")
+        Err(e) => test.fail(e.message())
+    match brotlienc.compress(data, quality(4, 16))
+        Ok(c)  => test.assert_eq(bytes.to_hex(c), "820300004076acebfa775dd7759d1f0bc75859a1324f4861412e4b79")
+        Err(e) => test.fail(e.message())
+
+    test.case("the empty input is the one-byte stream the format names")
+    match brotlienc.compress(bytes.zeros(0), brotlienc.fastest())
+        Ok(c)  => test.assert(c == brotlistream.empty_stream())
+        Err(e) => test.fail(e.message())
+
+    test.case("a stored stream is a header, the bytes, and the last-empty block")
+    match brotlienc.store(bytes.from_str("abc"), 16)
+        Ok(c)  => test.assert_eq(bytes.to_hex(c), "20001061626303")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_stored_stream_of_any_size_reads_back() [io]
+    for n in [0, 1, 65535, 65536, 65537, 140000]
+        test.case("${n} bytes stored")
+        let data = gen_random(n, 10)
+        match brotlienc.store(data, 22)
+            Err(e) => test.fail(e.message())
+            Ok(c)  =>
+                match brotlidec.decompress(c, roomy())
+                    Ok(b)  => test.assert(b == data)
+                    Err(e) => test.fail(e.message())
+
+@test
+fn test_write_and_finish_hand_over_what_fits() [io]
+    let data = gen_mixed(5000, 11)
+    let q = quality(2, 22)
+    test.case("a one-byte buffer takes the stream a byte at a time")
+    match brotlienc.encoder(q)
+        Err(e) => test.fail(e.message())
+        Ok(e0) =>
+            var e = e0
+            var out = bytes.zeros(1)
+            var got = [] as [Bytes]
+            match brotlienc.write(var e, data, var out, 0)
+                Ok(n)  =>
+                    got = list.push(got, bytes.slice(out, 0, n))
+                Err(f) => test.fail(f.message())
+            var more = true
+            var guard = 0
+            while more and guard < 100000
+                guard = guard + 1
+                match brotlienc.finish(var e, var out, 0)
+                    Ok(n)  =>
+                        if n == 0
+                            more = false
+                        else
+                            got = list.push(got, bytes.slice(out, 0, n))
+                    Err(f) =>
+                        more = false
+                        test.fail(f.message())
+            test.assert_eq(brotlienc.emitted(e), bytes.len(bytes.concat(got)))
+            match brotlidec.decompress(bytes.concat(got), roomy())
+                Ok(b)  => test.assert(b == data)
+                Err(f) => test.fail(f.message())
+
+    test.case("input in pieces is the same stream as input at once")
+    match brotlienc.encoder(q)
+        Err(e) => test.fail(e.message())
+        Ok(e0) =>
+            var e = e0
+            var out = bytes.zeros(100000)
+            var at = 0
+            for k in 0..5
+                match brotlienc.write(var e, bytes.slice(data, k * 1000, k * 1000 + 1000), var out, at)
+                    Ok(n)  =>
+                        at = at + n
+                    Err(f) => test.fail(f.message())
+            match brotlienc.finish(var e, var out, at)
+                Ok(n)  =>
+                    at = at + n
+                Err(f) => test.fail(f.message())
+            match brotlienc.compress(data, q)
+                Ok(whole) => test.assert(bytes.slice(out, 0, at) == whole)
+                Err(f)    => test.fail(f.message())
+
+    test.case("advanced answers the encoder it is given")
+    match brotlienc.encoder(q)
+        Err(e) => test.fail(e.message())
+        Ok(e0) => test.assert_eq(brotlienc.emitted(brotlienc.advanced(e0)), 0)
+
+    test.case("nothing can be written after the stream is finished")
+    match brotlienc.encoder(q)
+        Err(e) => test.fail(e.message())
+        Ok(e0) =>
+            var e = e0
+            var out = bytes.zeros(64)
+            match brotlienc.finish(var e, var out, 0)
+                Ok(n)  => test.assert(n > 0)
+                Err(f) => test.fail(f.message())
+            match brotlienc.write(var e, data, var out, 0)
+                Ok(_)  => test.fail("the stream was finished")
+                Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_the_encoder_refuses_what_it_does_not_implement() [io]
+    test.case("a quality past the declared range")
+    match brotlienc.compress(gen_text(10, 1), quality(5, 22))
+        Ok(_)  => test.fail("quality 5 is not implemented")
+        Err(e) => test.assert_eq(e.message(), "brotli: quality 5 is not implemented, the range is 0 to 4")
+    match brotlienc.compress(gen_text(10, 1), quality(0 - 1, 22))
+        Ok(_)  => test.fail("quality -1 is not a quality")
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("window bits outside 10 to 24")
+    match brotlienc.encoder(quality(2, 9))
+        Ok(_)  => test.fail("9 is below the range")
+        Err(e) => test.assert_eq(e.message(), "brotli: the window bits field 9 is not defined")
+    match brotlienc.compress(gen_text(10, 1), quality(2, 25))
+        Ok(_)  => test.fail("25 is above the range")
+        Err(e) => test.assert(e.message() != "")
+    match brotlienc.store(gen_text(10, 1), 9)
+        Ok(_)  => test.fail("9 is below the range")
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("the worst case grows with the input")
+    test.assert(brotlienc.max_compressed_size(1000000) > brotlienc.max_compressed_size(1000))
+
+@test
+fn test_the_codes_a_small_alphabet_needs_are_simple_and_the_rest_complex() [io]
+    test.case("four symbols, skewed, give lengths 1 2 3 3")
+    var skew = [] as [Int]
+    var x = 12
+    for _ in 0..3000
+        x = step_lcg(x)
+        let r = (x >> 16) & 7
+        skew = list.push(skew, (if r < 4 then 97 elif r < 6 then 98 elif r < 7 then 99 else 100))
+    let skewed = bytes.from_byte_list(skew)
+    match round_trip(skewed, quality(2, 22))
+        Ok(b)  => test.assert(b == skewed)
+        Err(e) => test.fail(e)
+
+    test.case("two and three symbols")
+    for k in [2, 3]
+        var xs = [] as [Int]
+        var y = 5
+        for _ in 0..2000
+            y = step_lcg(y)
+            xs = list.push(xs, 65 + (y >> 16) % k)
+        let d = bytes.from_byte_list(xs)
+        match round_trip(d, quality(1, 22))
+            Ok(b)  => test.assert(b == d)
+            Err(e) => test.fail(e)
+
+    test.case("all 256 byte values once each, so every code length is the same")
+    var perm = [] as [Int]
+    for i in 0..256
+        let v = (i * 167 + 13) & 255
+        perm = list.push(perm, v)
+    let flat = bytes.from_byte_list(perm)
+    match round_trip(flat, quality(2, 22))
+        Ok(b)  => test.assert(b == flat)
+        Err(e) => test.fail(e)
+
+    test.case("a code with long runs of unused symbols, which symbol 17 writes")
+    var sparse = [] as [Int]
+    var z = 3
+    for _ in 0..4000
+        z = step_lcg(z)
+        let r = (z >> 16) & 31
+        sparse = list.push(sparse, (if r < 8 then r * 31 else 40 + r))
+    let sp = bytes.from_byte_list(sparse)
+    match round_trip(sp, quality(3, 22))
+        Ok(b)  => test.assert(b == sp)
+        Err(e) => test.fail(e)
+
+@test
+fn test_stored_output_that_wraps_the_decoders_window_is_read_back() [io]
+    let data = gen_random(3000, 12)
+    match brotlienc.store(data, 10)
+        Err(e) => test.fail(e.message())
+        Ok(c)  =>
+            match brotlidec.decompress(c, roomy())
+                Ok(b)  => test.assert(b == data)
+                Err(e) => test.fail(e.message())
+
+@test
+fn test_dictionary_words_are_found_in_input_that_repeats_nothing() [io]
+    // Two hundred different words of the dictionary, eight to twelve bytes
+    // each, so that nothing in the input matches anything earlier and the
+    // only thing to find is the dictionary itself.
+    var words = [] as [Bytes]
+    for k in 0..200
+        let len = 8 + k % 5
+        match brotlidict.word(len, k * 3 + 1)
+            Ok(w)  =>
+                words = list.push(words, bytes.clone(w))
+            Err(_) =>
+                words = list.push(words, bytes.zeros(0))
+    let data = bytes.concat(words)
+    for wbits in [10, 16, 22]
+        for level in [2, 4]
+            test.case("window bits ${wbits}, quality ${level}")
+            match brotlienc.compress(data, quality(level, wbits))
+                Err(e) => test.fail(e.message())
+                Ok(c)  =>
+                    test.assert(bytes.len(c) * 2 < bytes.len(data))
+                    match brotlidec.decompress(c, roomy())
+                        Ok(b)  => test.assert(b == data)
+                        Err(e) => test.fail(e.message())
+
+    test.case("with the dictionary switched off the same input is not smaller than half")
+    let off = BroQuality { level: 4, window_bits: 22, use_dictionary: false, text_hint: false }
+    test.assert(size_of(data, off) * 2 > bytes.len(data))

@@ -6,11 +6,6 @@ Brotli is a lossless compression format, specified in
 package reads and writes it in novo-lang, and performs no input or output
 itself.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What Brotli is
 
 Brotli is an LZ77 compressor with prefix coding over it, like DEFLATE, plus
@@ -60,25 +55,45 @@ Decompressing an HTTP response body, whose size the server chose and whose
 ceiling you choose.
 
 ```novo ignore
+use std.bytes
 use brotlistream
 use brotlidec
 
-fn read_body(socket: Socket, out: Bytes) -> Result<Int, BroFault> [io, net]
-    var head = read_some(socket)
-    var d = brotlidec.decoder(head, brotlistream.small_limits())!
+// `socket`, `read_some` and `flush` are the caller's own.
+fn read_body(socket: Socket, var out: Bytes) -> Result<Int, BroFault> [io, net]
+    var d = brotlidec.decoder(read_some(socket), brotlistream.small_limits())!
     var written = 0
-    loop
-        match brotlidec.step(d, out, written)
+    var going = true
+    while going
+        match brotlidec.step(var d, var out, written)
             BroProduced(n) =>
                 written = written + n
-                d = brotlidec.advanced(d)
             BroNeedMore =>
-                d = brotlidec.feed(d, read_some(socket))!
+                brotlidec.feed(var d, read_some(socket))!
             BroWantsDrain =>
                 written = written - flush(out, written)
             BroDone =>
-                break
-    Ok(written)
+                going = false
+    match brotlidec.fault_of(d)
+        Some(f) => Err(f)
+        None => Ok(written)
+```
+
+Whole streams already in memory need none of that:
+
+```novo
+use std.bytes
+use brotlidec
+use brotlienc
+use brotlistream
+
+fn main() [io]
+    match brotlienc.compress(bytes.from_str("hello hello hello hello"), brotlienc.best_declared())
+        Err(e) => println(e.message())
+        Ok(packed) =>
+            match brotlidec.decompress(packed, brotlistream.small_limits())
+                Ok(text) => println(bytes.to_str(text))
+                Err(e) => println(e.message())
 ```
 
 Build and test with:
@@ -87,9 +102,6 @@ Build and test with:
 novo pkg build
 novo test
 ```
-
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: brotli-nv.<module>.<fn>`.
 
 ## What the package contains
 
@@ -105,8 +117,7 @@ Today `novo test` fails on purpose: every assertion reaches
 | `brotlienc` | The encoder, at quality 0 to 4. |
 | `brotlierror` | `BroFault`, its message, and the two questions `is_budget` and `fault_at`. |
 
-Nine modules, 119 public functions, 8 boxed structs, 6 plain value structs, and
-7 enums with 36 variants between them. No function opens a file, reads a clock
+Nine modules, 141 public functions, 16 structs and 7 enums between them. No function opens a file, reads a clock
 or waits for anything.
 
 ## How to choose an entry point
@@ -127,7 +138,7 @@ example above, and "Feeding and draining are two questions".
 This is the one thing about Brotli that has no counterpart in another LZ format,
 and it is where a decoder written from another one goes wrong.
 
-```novo
+```novo ignore
 pub enum BroReference
     BroBackRef(distance: Int, length: Int)
     BroDictWord(length: Int, index: Int, transform: Int)
@@ -174,7 +185,8 @@ it, and the dictionary arm is the one it cannot forget.
    decoder to know. A decoder without the dictionary is not a smaller decoder;
    it is one that produces wrong bytes. The same goes for the transforms:
    `" of the "` is not a word in the dictionary, it is `"of"` with transform 7.
-5. **The distance cache is seeded with 16, 15, 11, 4**, not with zeroes. A
+5. **The distance cache is seeded with 4, 11, 15, 16**, newest first, not with
+   zeroes. A
    stream may reference the cache before it has produced a distance of its own,
    and a decoder that started from zeroes decodes the first symbols of *every*
    stream differently. `brotlidist.initial_cache`.
@@ -207,7 +219,7 @@ The faults are `BroWindowTooLarge(want, limit)`, `BroBadWindowBits(bits)`,
 `BroBadSimpleCode(at, count)`, `BroBadMetaBlock(at, field)`,
 `BroBadBlockType(at, kind, count)`, `BroBadContextMap(at, size)`,
 `BroBadDictWord(length, index)`, `BroBadTransform(id)`,
-`BroLengthMismatch(declared, produced)`, `BroBadQuality(want)` and
+`BroBadDistance(distance, produced)`, `BroLengthMismatch(declared, produced)`, `BroBadQuality(want)` and
 `BroOutputFull(pending)`. `brotlierror.is_budget` distinguishes the ones that
 are a limit meeting a well-formed stream from the ones that mean the stream is
 wrong.
@@ -221,9 +233,18 @@ and the decoder is holding finished bytes.
 A single "not done" answer would leave a caller guessing which to do, and the
 guess that feeds more into a full decoder is an unbounded buffer.
 
-`brotlidec.pending_input` is published so a test can assert the decoder is not
-accumulating. It is bounded by the longest single symbol the format can write,
-which is a constant and not a function of the input.
+`brotlidec.feed` and `brotlidec.step` write into the decoder they are given,
+so both take it as a `var` argument. The decoder keeps the input it has not
+used and the window, and nothing else of the compressed stream: what it has
+consumed is dropped at the next `feed`. `brotlidec.pending_input` is published
+so a test can assert it. The decoder reads a stream in units and rewinds a
+unit it could not finish; the unit is a command or a literal, except for a
+meta-block's description (its block types, context maps and prefix codes),
+which is read whole. So after a `BroNeedMore` the unread input is a few bytes,
+or the part of one description that has arrived.
+
+A decoder that has failed answers `BroDone`; `brotlidec.is_failed` and
+`brotlidec.fault_of` say why, and `feed` refuses more input.
 
 ## The dictionary is 122784 bytes
 
@@ -235,21 +256,48 @@ and `brotlidict.word_count` are functions and the test suite asserts them.
 ## What the encoder does
 
 The reference implementation has eleven quality levels. This package declares 0
-to 4: greedy matching, a hash chain, a lazy match at 3 and 4, and prefix codes
-built from the block's own histogram. What lies above that — block splitting and
-context clustering — is most of the remaining compression ratio.
+to 4, all of them greedy:
 
-An interface that declared quality 11 and produced quality-4 output would be a
-claim nothing could check, so the gap is a value instead.
-`brotlienc.quality_range()` is `[0, 4]`, `brotlienc.format_max_quality()` is 11,
-`brotlienc.splits_blocks()` is false, and
-`brotlienc.supports_custom_dictionary()` is false. A caller comparing output
-sizes against another library can name which feature is missing.
+| Level | Candidates looked at | Lazy match | Dictionary |
+| --- | --- | --- | --- |
+| 0 | 1 | no | no |
+| 1 | 4 | no | no |
+| 2 | 16 | no | yes |
+| 3 | 32 | yes | yes |
+| 4 | 64 | yes | yes |
 
-Expect roughly 3 to 8 per cent larger output than the reference compressor at
-quality 11 on HTML, and closer than that on text where the dictionary does the
-work. Every stream this produces is a valid Brotli stream that any decoder
-reads.
+Input is cut into meta-blocks of 128 KiB. Each uses one block type, one literal
+code and one distance code, and the encoder writes whichever of the compressed
+and the stored form is smaller. The matcher reaches back across meta-blocks by
+128 KiB, whatever window the stream declares. It uses the static dictionary for
+words of eight bytes or more that appear unchanged; the 121 transforms are not
+searched.
+
+What lies above that — block splitting, context modelling and a search for the
+cheapest parse — is most of the remaining compression ratio. An interface that
+declared quality 11 and produced quality-4 output would be a claim nothing could
+check, so the gap is a value instead. `brotlienc.quality_range()` is `[0, 4]`,
+`brotlienc.format_max_quality()` is 11, `brotlienc.splits_blocks()` is false, and
+`brotlienc.supports_custom_dictionary()` is false.
+
+Measured against the reference compressor (libbrotli 1.1.0) at a 4 MiB window:
+
+| Input | Bytes | Level 0 | Level 4 | Reference q5 | Reference q11 |
+| --- | --- | --- | --- | --- | --- |
+| Python source | 53688 | 17441 | 13829 | 13813 | 12197 |
+| 600 KB of Python source | 600000 | 179297 | 133581 | 134073 | 128375 |
+| An HTML page | 10220 | 367 | 268 | 263 | 205 |
+| UTF-8 text in four scripts | 3360 | 131 | 105 | 104 | 103 |
+| 20000 bytes of a short repeating pattern | 20000 | 881 | 584 | 508 | 437 |
+| Random bytes | 5000 | 5004 | 5004 | 5004 | 5004 |
+
+Level 4 is within a fraction of a per cent of the reference at quality 5 on
+source code, and 10 to 15 per cent behind it on small repetitive inputs. Every
+stream this encoder produces is a valid Brotli stream that any decoder reads;
+the reference decoder read every one of the 90 streams the corpus above made at
+the five levels.
+
+The decoder runs at about 35 MB/s of output on text.
 
 ## What is not included
 
@@ -259,8 +307,8 @@ reads.
   the caller's own bytes prepended to the window rather than indexed by length.
   `brotlienc.supports_custom_dictionary` answers false.
 - **The large-window extension.** `brotlistream.large_window_max_bits` names it
-  as 30 and `parse_header` reads the flag, but a stream using it is not RFC 7932
-  and accepting one is a decision a caller makes with its own limits.
+  as 30, but `parse_header` refuses its spelling of the window field with
+  `BroBadWindowBits`, because a stream using it is not RFC 7932.
 - **Threads.** Nothing in this package starts one.
 - **An integrity check.** There is none in the format. A caller that needs to
   know the bytes are the ones that went in brings its own, and
@@ -279,12 +327,12 @@ reads.
 
 ## Related packages
 
-- bitstream-nv supplies the low-bit-first bit reader every field in the format
-  is read through. It is the only dependency. Brotli is low-bit-first throughout
-  with no backward reads, so this package needs nothing that package does not
-  already publish.
+- This package reads bits through a reader of its own (`BroReader`, in
+  `brotlistream`) and depends on nothing: Brotli is low-bit-first throughout,
+  with no backward reads, and a read past the end sets a flag that lets a
+  parser rewind instead of failing.
 - [zstd-nv](https://novo-lang.org/packages/zstd-nv) answers the same window
-  question the same way, and takes the same bit reader.
+  question the same way.
 - [flate-nv](https://novo-lang.org/packages/flate-nv) is DEFLATE, gzip and zlib:
   no dictionary, no context modelling, and a checksum in both containers.
 
@@ -309,23 +357,6 @@ the specification, and the section numbers in the module headers are its.
 
 Where the reference implementation and this package disagree about the bytes a
 stream decodes to, the reference implementation is right.
-
-## Implementation status
-
-Every function is a `todo()`. Every type is declared. The suite is 32 tests and
-232 assertions, red until the bodies land.
-
-| Module | Implemented |
-| --- | --- |
-| `brotlistream` — `BroLimits`, `BroHeader` and their ten functions | no |
-| `brotliblock` — `BroBlockKind`, `BroBlockHeader`, `BroCategory`, `BroBlockState`, `BroCommand` and their fourteen functions | no |
-| `brotliprefix` — `BroPrefix`, `BroSimple` and their eighteen functions | no |
-| `brotlicontext` — `BroContextMode`, `BroContextMap` and their twelve functions | no |
-| `brotlidist` — `BroReference`, `BroDistCache`, `BroDistParams` and their fourteen functions | no |
-| `brotlidict` — `BroTransform`, `BroTransformKind` and their sixteen functions | no |
-| `brotlidec` — `BroStep`, `BroDecoder` and their thirteen functions | no |
-| `brotlienc` — `BroQuality`, `BroEncoder` and their eighteen functions | no |
-| `brotlierror` — `BroFault` and its four functions | no |
 
 ## Licence
 

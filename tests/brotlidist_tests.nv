@@ -1,9 +1,6 @@
 // brotlidist_tests.nv — one number, three meanings, and the one that
 // every other LZ format calls corrupt.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: brotli-nv.<module>.<fn>`.
-//
 // THE ASSERTION THIS SUITE EXISTS FOR: a distance larger than the
 // number of bytes produced so far is a DICTIONARY REFERENCE, not an
 // error.  A decoder that refused it rejects a large share of real HTTP
@@ -11,8 +8,8 @@
 // checksum catches, because Brotli has no checksum.  `resolve` answers
 // a typed value so neither mistake is spellable.
 //
-// THE VECTORS are RFC 7932's own: the seeded distance cache (16, 15,
-// 11, 4), the alphabet size formula of § 4, and the 4-to-24 word
+// THE VECTORS are RFC 7932's own: the seeded distance cache (4, 11,
+// 15, 16, newest first), the alphabet size formula of § 4, and the 4-to-24 word
 // length range of § 8.
 
 use std.test
@@ -28,7 +25,7 @@ fn test_a_distance_past_the_output_is_a_dictionary_word_and_not_an_error() [io]
 
     test.case("THE CLAIM: the distance the format calls corrupt is the one it uses most")
     test.assert(brotlidist.reaches_dictionary(5000, 100))
-    test.assert(brotlidist.reaches_dictionary(50, 100) == false)
+    test.assert(not brotlidist.reaches_dictionary(50, 100))
 
     test.case("so an ordinary back reference resolves to a back reference")
     match brotlidist.resolve(p, c, 20, 0, 10000, 6)
@@ -62,7 +59,7 @@ fn test_the_only_corrupt_case_sits_beside_the_two_good_ones() [io]
 
     test.case("and it converts to a fault for a caller that would rather propagate")
     match brotlidist.out_of_range_fault(BroDistOutOfRange(9000, 4))
-        Some(f) => test.assert(brotlierror.is_budget(f) == false)
+        Some(f) => test.assert(not brotlierror.is_budget(f))
         None    => test.assert(false)
 
     test.case("while a good reference has no fault to convert")
@@ -72,32 +69,32 @@ fn test_the_only_corrupt_case_sits_beside_the_two_good_ones() [io]
 fn test_the_distance_cache_is_SEEDED_and_a_decoder_that_zeroed_it_is_wrong() [io]
     let c = brotlidist.initial_cache()
 
-    test.case("THE CLAIM: 16, 15, 11, 4 — from the specification, not a convenience")
-    test.assert(c.d0 == 16)
-    test.assert(c.d1 == 15)
-    test.assert(c.d2 == 11)
-    test.assert(c.d3 == 4)
+    test.case("THE CLAIM: 4, 11, 15, 16, newest first — from the specification, not a convenience")
+    test.assert(c.d0 == 4)
+    test.assert(c.d1 == 11)
+    test.assert(c.d2 == 15)
+    test.assert(c.d3 == 16)
 
     test.case("because a stream may reference the cache before it has produced a distance")
     test.assert(brotlidist.is_cache_code(0))
     test.assert(brotlidist.is_cache_code(15))
-    test.assert(brotlidist.is_cache_code(16) == false)
+    test.assert(not brotlidist.is_cache_code(16))
 
 @test
 fn test_reusing_d0_does_not_move_the_cache_and_everything_else_does() [io]
     let c = brotlidist.initial_cache()
 
     test.case("THE CLAIM: code 0 names d0 and leaves the cache alone")
-    let same = brotlidist.push(c, 0, 16)
-    test.assert(same.d0 == 16)
-    test.assert(same.d1 == 15)
+    let same = brotlidist.push(c, 0, 4)
+    test.assert(same.d0 == 4)
+    test.assert(same.d1 == 11)
 
     test.case("and any other distance pushes, dropping the oldest")
     let moved = brotlidist.push(c, 20, 900)
     test.assert(moved.d0 == 900)
-    test.assert(moved.d1 == 16)
-    test.assert(moved.d2 == 15)
-    test.assert(moved.d3 == 11)
+    test.assert(moved.d1 == 4)
+    test.assert(moved.d2 == 11)
+    test.assert(moved.d3 == 15)
 
 @test
 fn test_the_three_ranges_are_three_predicates_rather_than_boundary_arithmetic() [io]
@@ -109,7 +106,7 @@ fn test_the_three_ranges_are_three_predicates_rather_than_boundary_arithmetic() 
     test.assert(brotlidist.alphabet_size(with_direct) == 16 + 16 + 192)
 
     test.case("with no direct codes the postfix range begins at 16")
-    test.assert(brotlidist.is_direct_code(plain, 16) == false)
+    test.assert(not brotlidist.is_direct_code(plain, 16))
     test.assert(brotlidist.is_postfix_code(plain, 16))
 
     test.case("and with sixteen of them it begins at 32")

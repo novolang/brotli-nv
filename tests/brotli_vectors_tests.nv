@@ -1,0 +1,376 @@
+// brotli_vectors_tests.nv — streams written by the reference compressor
+// (libbrotli through its C interface), decoded back into the bytes that
+// went in.
+//
+// Every input is regenerated here by a small deterministic function, so
+// the suite carries the compressed stream and not the text: `gen_text`
+// strings sixteen words together with a linear congruential generator,
+// `gen_mixed` replaces every fifth word with eight pseudo-random bytes so
+// that the compressor has two kinds of content to tell apart, and
+// `gen_random` is bytes that do not compress.  The same functions in
+// Python made the streams.
+//
+// What each stream is there to exercise:
+//
+//   text_q5, text_q11, text_q1, text_q0   the four shapes of command the
+//                                         qualities produce, with context
+//                                         maps and several literal trees
+//   mixed_q11                             block types and block switching
+//   random_q5                             a stored meta-block
+//   html_q11                              static dictionary references, with
+//                                         transforms
+//   stream_pieces                         metadata meta-blocks (the empty
+//                                         ones a flush writes) between
+//                                         compressed ones
+//   small_window                          a 1008-byte window, so distances
+//                                         past it are dictionary words
+//   empty                                 the one-byte stream
+
+use std.bytes
+use std.list
+use std.test
+use brotlidec
+use brotlierror
+use brotlistream
+
+const WORDS: [Str] = ["the",
+    "brotli",
+    "stream",
+    "of",
+    "compressed",
+    "bytes",
+    "<div>",
+    "</div>",
+    "window",
+    "dictionary",
+    "literal",
+    "insert",
+    "copy",
+    "distance",
+    "prefix",
+    "code"]
+
+fn step_lcg(x: Int) -> Int
+    (x * 1103515245 + 12345) & 2147483647
+
+fn gen_text(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var parts = [] as [Bytes]
+    var total = 0
+    while total < n
+        x = step_lcg(x)
+        var w = bytes.from_str(WORDS[(x >> 16) & 15] + " ")
+        parts = list.push(parts, w)
+        total = total + bytes.len(w)
+    bytes.slice(bytes.concat(parts), 0, n)
+
+fn gen_mixed(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var i = 0
+    var parts = [] as [Bytes]
+    var total = 0
+    while total < n
+        x = step_lcg(x)
+        i = i + 1
+        if i % 5 == 0
+            var chunk = [] as [Int]
+            for _ in 0..8
+                x = step_lcg(x)
+                chunk = list.push(chunk, (x >> 16) & 255)
+            parts = list.push(parts, bytes.from_byte_list(chunk))
+            total = total + 8
+        else
+            var w = bytes.from_str(WORDS[(x >> 16) & 15] + " ")
+            parts = list.push(parts, w)
+            total = total + bytes.len(w)
+    bytes.slice(bytes.concat(parts), 0, n)
+
+fn gen_random(n: Int, seed: Int) -> Bytes
+    var x = seed
+    var out = [] as [Int]
+    for _ in 0..n
+        x = step_lcg(x)
+        out = list.push(out, (x >> 16) & 255)
+    bytes.from_byte_list(out)
+
+fn html() -> Bytes
+    bytes.from_str("<!DOCTYPE html><html><head><title>International development report</title></head><body><p>The government said the information was published on the internet; however, the international community was not satisfied with the report and the development of the programme.</p></body></html>")
+
+fn concat3(a: Bytes, b: Bytes, c: Bytes) -> Bytes
+    bytes.concat([a, b, c])
+
+fn unhex(h: Str) -> Bytes
+    bytes.from_hex(h) ?? bytes.zeros(0)
+
+fn v_text_q5() -> Bytes
+    unhex("13b70b00449dee7a731dc5efd892e06012d122a8c9c209edffaf6d42c020100ca1514844db9b6053e4552d9c062fa44968bd5debb88e93f2037e14d77740885f184f7a2f64bc7d0d4dbe739bb9f87c8940c1af82f99c02f40b149b0160e31f19e4e7390f4f841f24043ae7601987f186a5e10ffeded1b7dd6727ee366520aee21d7d8fbff5b20918dfe3cc0b5a54ecbc09500603b8d388e755cc0a7067045fe797d094835cfa1147500a74c158a9316ff4148a4b915088c1f5a1d279eb53aff2866517f446aa63de5ce5fe46974e1c88daa05641e27fb1d8583ecc4e0e449a98982c17dc075c4c79f2c35dee860eb60fe811567232e9df55da9219b9a5f92f5c04d8a82f0826e0ba975766c939948a8cf445423ccbf63ed2581d079c800087a0927e5c765c140185f7f8a596a9ad9bedb44aa4330da756d93103ebcd576ed7598c21350b4fb5f43ce5a63dded2373d3152534b00d2ea6104e2e616a38d439cebda1d81e745bb7455a7da2b0e7856d01334352abdfb0c7dac716833cc124fa5cafed01b47938863fc705d5d590a62c94f1496df32f3b45e5af425d7d224b249924be8e35b27dadef51fcaa3a516f1c82e97e590568d426c0d282cb28a181dc97b60b1d05294d10dcc4abde0b37b9621c8e1a16076c63860eb516e7576b6b999cb247ac8b09c729eeff47ad1ba0ce90d2bd7fc5ed963b59dd2cfefb30238cedeaa53ba5c520d9171edd4d8ce37ac5354a7796c442a12384bb644d3212b388b9e964c0723120a20eadf7e72439dcfa31e36d624536feec0355ad2bff4863b2ea3d717c72e2ddf78bb1aacee5421463517c13dc404")
+
+fn w_text_q5() -> Bytes
+    gen_text(3000, 1)
+
+fn v_text_q11() -> Bytes
+    unhex("1b6f17008cd4512d3c96a0dc96ea52584bee1f1484135d31cca0feff1e05f666f75fc01caf552873e74963bf51ad0d69d99b9eb4117c80ecebffc5f9312ebd57147288737517dbdf26d03cf6d2ffe42f4ff819bffd7e3c08265e66e89b482a79e9bb9027b333b7ebff32f918987f792d0b295c467bab1caf7f3ffccd625d61ba37bfcdb22af7c5afabbb37547c4c5d72458a6b043cfbae7cf37204ec8b251f2a610bf53377a9bc7b64047cb9f21cfa59178abc0db708500fc2a2378c3e16ae30e3d959481d6e9821f2d4e45d56aea09935d81c2eb12274f895fe2db13be6a699bb0e6e0e19baf4269b18a4f8a2ec9ceda351bec81e20077afc4a49472904c9879ebe9cd504d70832fc5c86a19ebb81372f6a60cff8f08bdde8c9b702463c50d25dbb05926412090962a27b4a7048dd887e383537374b7eb37768da868cc682e540cf85515ec7cae1944586dcd556798bf4889ba072508f7487fbb596c6273cc36acdf434d084bb854eb64173d2de4214805c91c1d8699a12d412df610adb781c6107eacb62c86d08c13705ac1e8171c40dbb0d4b82b4996c501524049fa486e52d16b2b4c194f3b32a8a1fcdc44d3002fbb51cba8baf90bfc98352200c677d71ac828d0fa2a810c8d2731bbc413704fa694260721112b356cc486f4671a0174bb4b4637d05e9365706ae5d1872e254e8d312c1e83b5b80aeae5fb7c4489c6c1f8e4a3fec2221f0eea41cc67d8dd61154a5c925673de21e69fd3129fe93dc719ec7b7c067a960d8c5f25b0b506acfd016aa4f38c15852ea910e0590487fd2ae31ce27100ccf7fe017363d4c215c1ade8c83b74aa7cc71d4241c40c2cb0266d46c24cc5998cfb0c56a5c15061ec02ecb20fd4e35a4b9dbe25512c46a271e7786a69062bed83afaf1f545ca01e4d58e1c04fc03d3052328eca897c8a8aa71664041e586e118cde5371f3ac3bc6cf0656b409c4973b21d84fcf0155136c301232799059def79955f13caaba578cab2e4ce5cc0f3eb9a0e8f0eb7c8add8e24eddda0cc205bad9e1d45d2301311b57eff0ceae549ab0735008feee72d07da0dfa6ab892a0e4cc25d45271e5913fb85a56ab11e5b649e64c4af6690cca9cabbdfb35f72a4919153022401610b5ceee7d95d7425e37c47df767404a21959ba0c7143153232e3780a603641a0cb8ab90867b2c1608b306be9583bb149ac0aa2894e8825e1e7172a78618451ce9e92c6ca1f42275ed16070130cb2fa850cc75a9d6224582f4fae94475a3586a803966d9dc0db6ca8a9371b18d1d6863193b083592edc59f7b8155e863811587b6bfe60a19c46d3b5a42c5b9b4e07d215aba0a464814cf01252b488a77c5cc2f3b8844a681101")
+
+fn w_text_q11() -> Bytes
+    gen_text(6000, 2)
+
+fn v_mixed_q11() -> Bytes
+    unhex("1b2723006400ceb9676989bab2b56098344b296f39cb7ad6b0e827e0fb1cebac191d040d93b4c1a5bc2643d3cee96010d23ef149daf74e96241f2631b42b499362ab0cb3839460befbaba98fbb851bc9ff37158dd7a133ef40fbd3dbfd3d43ceff48e96b7b9bc963f4d0cc86a6f69d384f3e807bfb6e63bc3d9e8e18f0b3f98b65f90363a7ba5187ebc329aeb96790fc28606ee329b4d949dc8eaa62cd7f056be57603b3f67fb8ed4ca21442aca226f00befbb675e0f26127a783ca409e0179fb562707991732b62fe7478c099e2978111707d3228cc6ecff52b1b8a20471363eaf5341c49285f00eaea33172636c16acc9a2326f7054449a36e8d3034f8c7d558d82e7df7d75a1c8bc3b6981f9c5ab9a494cbc6e6d735bb6b14ace0dd498eaf65273a83af0e193f9c7c8f278cdf7d7ecc91b61d3cbd71137c413f871c9daae7461ef5a0df5e3763f65c691a231ed4d940fc77ab0775f77c350705444d43aa537a9777dbabe8805efe08c95060b256df3a1b75ef78935424e81c44a072683f657b1d2690f85174b9d5b64ccd792db3e3021672a412b2966540243ba6b1b6dc3723886286e5a60ab523fa90c38b0cc60d5509c1dc0238d3be676813cddd5ad5d4ceaf4b9fe9cb4e8799d8f911883f497b83a2f5643fac860536211a46580f26dd1cc2236ec44b0e41ae221865ce985062498fc46551859de8b697350ae719f8861f06caacaa115559926796970cb2e2d2b0a6d2a55d412b48f134f764beff676592301325769bc0c992c4c1b79fa5ac79d48d33c9326033f809e62eedb9bcf23e36b0d1c6a3b2ecc9e3b5ee500dd6bf57af50b2dbfa50ec5f0a69146828f919c2123dfc4e6402232d9179a006f2e15883194ba2998783fda75df391e78637d6525ad2f1670bdfe03789b50f5e32c3398cf7caf65f6e6a1fda289c90c71802050ed97b5f8f8cce754652f12d388989ef50f4718322f800906368fda24088fc31c82bb66eaa554d730ab2407cf75f99c7e646aef133c8131d60a89c68017ce79af12329a5741a01e5acc3c525a6280c2da8d728674134870878b36b33b4fc52062c16c97336f567125f886c0406f3d2dd91799b4f12d5029831d5f9487c9a241968c3c0693186115f6facc7370d0e648c140b1ccafcb3bc000207d4d9f0c25fc2f26cf1af8d2dc33a5f7cc9b3388ecca5c3c63c9000a3a58c11a91915629b5ba9803f8e0f299c44f856f7a3aef4f2f996c53cbcb2e63af6c6732d3112b9eebc2e8966f6c02f7d357ed663c2e4ebe67e15a1482a792c4470cc9c0f5396502e0ee403f1440bbc832be2a16896e2728217165ea844c20d0cba98c49fa02e86290b811f76cfa6a397a84425718fafd53692d83ff9ee2084dcf49fb74af463dea8394fcfad8eeefc74de20001dcd2dd670737f2762d4367004dea01f7388261a69cf4b523bf4c6c992cf4166c1771708af427fe0606bccc488b9ce6a0588f6a81468104cf942f90f053090e9f21870cec972022cb0cf3269069065c5b32d722cee92bbc926addb03ba5d302f68962387c176de944e25043e29759e7c983e4d91eee1f7ae22ea54e528cc3f09af3f99f56e98b476d2e431019bb85490e25956264c6baf57db4da7944bcb97a2c3818284bc045e36104d7d352fe1766b1d2557428760c53cac7f078a201a584710bb41c10e6526fbd00f744318daa5fe30e12999349e817cfa364ceae0ca61ff0b63c1c598599f3cc695739881e5af8775dcc49c09c402862f281e73c321ed87beffca5404554c6986508beedcb6c71af00f7e0aa4fcf0a8b33bd3c818d1feb1bcee3c3e972026cc65312f52419585617092f91b155d04f066e17ba87cd5c5902ddaa34993c998c648f3c15afea985c9a70bb191ec73e688a2d0dda8da3685c36933a55a476dd1309e3465601fe9f8c06991155111ddbcecebea3ee914ae1ed4d5db37e94b0bc0bd3869d21576d764ac31762aae1a17cc74e591321c94a8a5057efeb77f578486fee4c0a809f4b8591a56f90f1d657847b8fb1003785390002fd17c2e0eddd124a355ddde0b70d9c2c54542ed8643762122b525f374d722d28b1965c5b7b45e529bf9c135119726bc3ca444af62b3d94515a04cb4658409f10f4369d303b3b4340699a3c9f46c935a7d9c5d1ecdea9ea1e18cea8c0ce8245a0a3b12bc2b36ba15459834b609b9abab72e434b5a610e1dae4812578347201aeb949c04d68c3eca89119092ad68c52c18e6a2b6316eca840984df32826de49085cd45999c80af3d618852377b1c5523144e2e2b2590ea6035668ef308deabe9062037c123bd1a8d17a3660ad0abf211386b02f4d4d12df071eb4a16d03d52a9490401b86b6ee9c2fc62e032142eb468c6cd5737a2e358637592771ab3805a13733c32e0022de293d893f49943aa9fb6af36919c2c68b175a814cf05fda4f721792aa5d370ea2c2696ad902983a848bd1f76d78e7ca283244bdb717e980fbf4a33ceef108296cce0d61d2430e8a18273bb3cf60de7f4b373c6e3ea6e684beb8d918c055316d3bf33a2cb90fa32b97754dcf24103c33838278150383a9828bd00f4b5672ffe331f3583fa8dee4d1b17c28f795028b93f3abe2721df96bfe670451ddde220b94a9b2431f1ae64d56e5e670e9534786da270c471fedf2d192812be886528530faa729951070993c6640c97c93d1a11b37c417e5a3896d5a9ec6b5bd27ca53964274ca2de35109bca8475728ad3c05209f21deea2643bc4d73a068101ce9755a8b4aaea49e8460bd24ac7cc22cdb4ec9dc70c19983b9e598e06090c13de50dcb758c18d1d8dda0902b7f14314368d6bc402ff7b0749e08af7adb45c3713865da7d6ce0c03d54464f8b936bd7e66aeae8f57027465b20a40a40dcdc6cef087d85f11740316d536c5ea207d99742fdeb7bdf4001433d6bf27c0fd64f92c620e3abe890d2c0824ff3856d7e02de03308f12277967360ebc2db69e3e95e582cf9ffee0d0981bec24689e53361309dc7a2e6f109cb11cc24152c4241917d7a68ea41de520ac1c638e00c71869bc47c1eefc8ae7a9ad16ecb04ddad3fad2b33bf51d80ce49ad640e9e5a9f428575b811869af100ef4f2666178963258615cfb25dd55c83fa17126d1e645a0cd16709e9e1e7f0c74c1002222566ae4ce3f21a5cc4b899af52a7fcbe52cbc3d8d19337b6cb532dddde88c3dc8c0d1b55f83683aebcf5a118cac0a19aef10caa5d2ece36bbfff96d935aa844b0ed36bbe76ca081547bb2a6cd3f909fe6328e50dc16e235099f92b3ae3ba23cdd0c7132e454b5bf4fb2a45477e9e9c9d57477d6e09013d812ea1302a6690d8360db15561ed2b4aef45d7634093b44903995d583d52cb8f8685c9c13ea94210d4d9d7707842055ecbf7bf8205c9a1ce2bbaf58157fea3b30626e6fafe48481d583b446b639a8ee6c8eb388a8add429429514334db3147544620e729d054be0f0c439f727cca688e344b6699fa8b70b7483adf262335fa38b537ad3ac95c65bff6fffada0def53d872b8c48797c576f2620da715168c1f53c1b91893da496d570060791a933d50285b38e779a6c094038fec64822d8be9b25a8da3e1a191358be596b772d55f68b32693465275a4d965d54475a18d45a3105a781d750bb0398c74bceee75510486baec1f63046bce55eaa77d245adf6c977db2b46b4cc844fb2802c9458fa0b7f0cfa95cddb622d67acb25108f11743e80f79d5963d52f9765d93ba1dbc95dbd3d1b6fbb8195ce48a37e1522b5f8dbe796e68f26a79136fae1b109a1b59571b6ed5f8a022581fb302b0376509a349c69e48fa25f8de6a8b930ccdffcfc8fabb1739eff3b706eedcd6eaa53c196c95e013a40b11897881b35b668e6cf77b4afb97459934d30ad2871d3c006d7e58d6cb62a9b740878f0270179d81d8e9d399c2ba5307f520dfa1f66f5a18785fcd874eb4901bd5140225a858c0fc1efe1c2b48fc07e362d51f110cf2c5cf9a751abda13434e3c013756162529aaf44d182107d4576883fb515c03c11359de213e7fd5085e161d92d3ba58133d48461722020888dc5b87f423e1cccc55e491b03458952e38ff91b33316ea75453a2df05307efa09ace75a759cf40ccf9ef576364871d7d8ce7b78d1417f56b8d30cfb0ac204b468e59609b3ecd4ad45ab9bceb02e131a83db06b5cce91d5354530eeafa8c74994fb1f4337c6d07cf0b52342f8047b88e1f78a93cbdf8544c7f51dd0aa43c19738f099400b59187a6025ea014916798354a67437bb828cfd50e5fcfadca9c0e9de880e9dfc7bd2f3703a56159977d1037280689789a45fb3835d17fdc5d80c0226d2fb8b7d239a73220d29f44de010192938d4e6a67b41bf0b68d0f062f0932a8496a879ed139473cb2be2064c05d47c13baa70eeea478b0746d040045129457f296b50392859e241c5c0af926e23a4d5dce4ca23b98c8bf76fc7f971999bb6e3f75df46647f73110163a33c59806e2eb8162b8f11bd7c7725c5a3d3e876713d48d06478e0904c6d7898df262a8b1a488cf149d0adac0efa8a23bfcc4d4c6b413d7ac4904635759f1a9ed9946a4547d3d9c4eae8a2afd28c93eaec93cb91a2b3c4e3c52fb82df3553285de61921a6eefc249326994a0289c70968422971a1017d8d2f9f96faa38f841b2574685bb649f5e5f6d4454a293c8dad896f050945224f116bc0754986d90895c6157d8677a9ebedf9da5dfd8f92a6587b05cf35982b6d25bacef122875f293640e8c22316b1134bd10331cd7296c7099ec07adf94ed444c944d193ea5a67fb9601295f992f41ac5ff0aa6676293a4de3ecc7bf500")
+
+fn w_mixed_q11() -> Bytes
+    gen_mixed(9000, 3)
+
+fn v_random_q5() -> Bytes
+    unhex("8bc7801966fb7f2f908295424b45799d1767e5b593808129caf3107a430f5d8ac7e8e3d6f0f33f73766456ca394846130e610e924ac5fc940f35da28593ed79ec71237c12a24bad3cf85cd4d8c0173538df8f2f9dcfe3d38b13225ae7f5f3e19bbd492926a03088971dc92849ce71a976c242aa2a1a35d4d8ae289c40fe9aa337b278d000a0b41cb36623d27c273511583dc4e45f12a740b713ba02260543224df02bfc561b17cd3f50e65ee541c3007aa18f599250e9aaa3e370080ca19ef24bf5dc298c76fd2d787d8a391ac5bd1a3bad1b85893c4e662cace4296a5b0f96bf4312c3094bd5a10c2b98fc821a74a2289fe2f3895c7716aebf7fd1c4a8f67305576954721112eb780a8c04a0b78b3bcf198f1f3828c53fc7babcaca0f3152adba239793c5e66402979ecfd1c24726a9c996983fb38da34f51e041574e0bd219fb30c8ced8b2142ae19254149f8cb922eaf0b9d67e427a9a4591fa7d5e97feabf096c0aeb2ed5767367ce6caf8be855d2a9fef6e3d22f0172fb48cf3974def9d724c19ecab0f46f16c551ead2755a192639ad003")
+
+fn w_random_q5() -> Bytes
+    gen_random(400, 4)
+
+fn v_html_q11() -> Bytes
+    unhex("1b1a01408d94a9eb136cc0b164d8fab70fc84e5a3d59c8dd9842b52ea5bba454bacdeb75a82826836a2b203587a28909a2a3b8e05e013a7c70db8870a9e8714eae5a754d9ead7e24550fdbc82ffb79a61fe345f5e1c4ed2874a599a2af815406")
+
+fn w_html_q11() -> Bytes
+    html()
+
+fn v_stream_pieces() -> Bytes
+    unhex("3038008098db28d54b416c611f0e94131d82f0c5df08d8f7efdb4f59256530b30565072772a4a74b63835bef5c2ad0400275d58fdd03b4f8befa03f9e517725833c1bf9cf2b8f4f2e217605675c75c09a1d0faf1a759be6e3c948bdbe9062d161406a0fca5d1d73cf6592386b7a3eee60488c05278d9794b1fb04530cb0c2bb1b9f444456f0c3f2bc9db631b5e498b13cb2835325120db04c500f63db886a2810b11c227cb87e99a97db05a87dabf17070a65143b2e948cc20d728bbd34e88976523d688d39fdd194565220cdf307a4c87ac0f32da2865f3d3b4ccef853358368df642455ea136cbd1391b3b03d815004086c6e593a313cd5b03a84a25c1d666c85d7908cd16bcc1f8518b1a8ab54e55a72a6e1e68866c6730016db7bf21e15c7acf6632496fa7cee1700445807b603546faced4524f0e7df5544185a34b724162e116cd00de656d1843f3274e6494cfa8c8e3a39ba0c2618750e75f56ad6c23f301bc9d275c41859985bb51c4c374551ac7567df2ba5a10797f9bbdec57705f04d38fdb6c4573ce80b77eba36d060a12f593aed812431d6133065801abc848eb9fc4bf70f149badd456071794a2d5a7d738b0af2f6f2eda70eed2fbb7842954308675638b30e87674cc19b1295746ae1ab0a4c38b355bdef40e141fe0a85f49b894fb38b0e72f3c7f81543476cfbc9ce6dab1e688a9a6b5556bf306bcb9b847834ed2ebd43472491571b5ddfd36ac5ef9388b1b389a9aed5b0e5d191a0420a6c700f14a004060038e65e3b474286d31a1fdf526150a9cde4edf8022c18d153ede579b199a40255ac031642fc9c26f040bb5bbd381a765fd99cc9bb208bf82d1d10cb2a5269a2d20bd0559a06c34fe95f96fe5ed106e19cd6e14fc21cba116d221f143193a815ae26dd2ab37df1217d0243d500848c5a81aee69a7f8dfce3d0bbde7cf40dcaba8240d68caec027121c262b3b965721f87898a1e18e78b304f7bf5dc70fadda3526f85f659833c0587e545f19258b45dd6763fce92521ac16778079187d37d5d8f4cbc5ccbec5143dc4615ecc1ca32ac56504bbb33695dd2f4bc9162800f1454789a860a34")
+
+fn w_stream_pieces() -> Bytes
+    concat3(gen_text(900, 5), gen_mixed(700, 6), gen_text(1200, 7))
+
+fn v_text_q1() -> Bytes
+    unhex("83e7030080aaaaaaeaff74e5c3cd0f17033fdd555544c005404cd94044c0dd153edf89b649578af786a1755f32342c8101f0ac605206e78649dee33b6305c1d8ee5b75eab8d11fc5f1fc7ff1d5ce3df260f17e52ab5430931d8eeb25fe7d63f139f05d9a0df1eab197629ed6c22545c712257ec601e435bc3547a0de1f1a8007ed959842fae2892b717d3d617443eae54935ffff0e89bafc7c0b7f7cbf9cda8f25c0db6d8c18ef5c915ab43f8f31cfa2022f7710845aef3b6336a7a7a96ec29d1cb7546151ad4838e55c77f6285daa0c2588d79c1439943e7066bdd620c3d88945a33c66b839b9bd4ca9d0a7aa24340086432646a8ca4ca8f546a42c2142d7e27c9f19c05f05ed4edf3c5463dcd3dfb1690b709a77697e0c2d9a381875e0e268a4bcf719afc6feca21a5bbc445cbbec5e3ed813183315f8e92e4d5c59cf68013e61374c7364550588addc46d075ce9355934ee1ff86ebf3b9087d7aa292d5354ffc59c1d1095720d96d01445197bd44f9267904739a3ccd108a668d164bfb2a2e61470898144b02ada85b79b8a70a440e22886356e1a739e353d35c751ec299c969eaea4510080074d78a30e8437748731188c217ac647e4c40a05b105b3fed31cb1334ee4eb54758b26ee0597d6ce91c3a66e8136a1e78edf71fb311075578c62678d36fa4c7506e3697e3b7508d219033823c13c09bd1fd941a4a5fa3e4f6b619ed6420f")
+
+fn w_text_q1() -> Bytes
+    gen_text(2000, 8)
+
+fn v_text_q0() -> Bytes
+    unhex("83ed020080aaaaaaeaff74e5c3cd0e17053ddd1711031300551505110155d3ffbbeadf736f75cfa82e6f63b82b5e2c2c2c6c6cacea654675f0e1c38fc160308e33595583c16030180ce65067442a4aa370586827d97b824f8e4cd2037dd194f800bfeb44b23396f12b3f483cca6c8c2ec1563aea0d7690b4109dc52e7c8d4ed70f14a1c472bf9a4617c874b6381cb2be483e2dc729f7ee341dcbd89d29f951b391f545c22f706c9296c4a4c1f498cbc7bef9bc4d2bf48de15cb21fe9810a84be67438e8f1319e4bef82e4d89e3195a9088c789877119f93f3469120eaccce257f36de55df1d6a543f96c73d7658b3dc8d536a045bf7a5dc0c80033df0b306ec3b2df369f6bf77dc1635c888ac30ba824ed36b6d0b7140311607b57fce7f8388681d0400772bf2fbf27748e02e8363ef62c47ec77056a393e0e3eb465ec4a27e12c0dca92e1d760297e425f5e1938f12e36c988f8b6d06d8c524c060d1fad518e1380c636db2db5902f0223d11167834ef9882f3254e47029328a850e966f5ae9353ebbd8c881882f0f2845a2c8a4e45a24b9c4e59423162e393e3e1d28b3724b24901cf6a1e47ae8eb7fa0b06deea4a0c4995438cbb7dc150a962b1445e89b1b90624846c42fc52429cb65c3e832682800454b679cfb880fc6896ef2753e92a82d3b77887164921e0c")
+
+fn w_text_q0() -> Bytes
+    gen_text(1500, 9)
+
+fn v_small_window() -> Bytes
+    unhex("a1389c0020ea9cca46b80a53eec49606063b19ff3954ad6109305f5b164ba9c30358e3927ced1f354662662d0b1fb0d7230b1a52f70b9cd5bf48aeffc25b73f9301fec630f7cc03b14fa6da34dbc3e7bc4d1df467ff50223fd88199909afedb8377f52a9fad11a9be5ff2c8cc7df5ef1e7e169f684063a169d359fbf307d83f5bdd820c6d16b4264778f09fb887c48f8df593b1ace96d02c4e06780c84d48214abdb8cf68ed867c5f5a84ccf58e42525df4f170ca8d4383f4faf157776a345df66a1138a852530b74686a2294a329919270c98d0f73229962879a13e96b1cef55094473512c99fcda00049968466419d5372b99235895fea1eb3d3da65d08c1e0eee0928d12e4f02219541f2b75b36e83bb6e37a335df7c5498e9e1605981fd6992f403aea7311d89256640c9c703f6de24ae21ff78e54e0410bbf65e5bfc0c89697a9a640634763b888dfb234c2ea4c85ef8000d047cfacb0a22ae24e45e4f961dd0a4c0747e5aee4d31dc00a23bb3ee01a736a8db1558949ac157b907172c3e40535da47dfa19613f592357448867b14d271c7894cf5b6057b184591f6497903413145dcd3bac9e78121c88d5d072585fea2fcb1ec03018ede476342c519abaa9acf2fd3e139d13d89c7de62797bf1dbe212ee423f481046711f0fd2f5b00b487c3072a381837a3ccf433653f34ce1d3d922a177ac6f1194f74e9b147d1aa1a3b1da3001648fd221d1a7494c41b5640311b3d427446b72944bf72d7e31521fed3c043ade4731b3a7c1e36980f724c740986b9a39a85b1c088a2812180f69db0046409407071257786fcd5143c0ed7df8e0ef05a86ea5c7b1a69da90e1c9474902cc16007d7556f94352830b4d6dc2ea65db40142115e3ba8a70ad72cc1cdc618969a2f2a1b1d2cf4b991ea7e0ce92856c81b1666c7999be63652e7a2cecf6aa38b0f51c7b882a07860d5bfa1473418bac8caf3f0a63bf8a5f53d4cb8482f8ef6c32abc290da9b15c479283d80cfc25ff7c3dad18554df4a0d907cb21fe319ebb90098c2a5c047d4a4eaf07afe2272af104ba067a752e619e202a1e8eca1600db87954ad2d40c53ec491065431e71ed325b67140d00882985ca85110a9d99982716ffc879c355f59ce18978a75bfa51f4ec60e85dd9a778bbee25c3220220862ed0387e6afa1e9ca910abbb1b319798bd808afad16c33494bb5688baed3bdd8754508619d43c124ce538ae30441ca61daef91dc1be941c232323683184e5672c4b9bd419df012d39c442b0d3cab57d0890808795016e04d88bb1bff07093dc56f97eae224388aaebc25d71facc5f00b")
+
+fn w_small_window() -> Bytes
+    gen_text(5000, 10)
+
+fn v_empty() -> Bytes
+    unhex("06")
+
+fn w_empty() -> Bytes
+    bytes.zeros(0)
+
+// The streams with the input each decodes to.
+fn all_streams() -> [Bytes]
+    [v_text_q5(),
+        v_text_q11(),
+        v_mixed_q11(),
+        v_random_q5(),
+        v_html_q11(),
+        v_stream_pieces(),
+        v_text_q1(),
+        v_text_q0(),
+        v_small_window(),
+        v_empty()]
+
+fn all_inputs() -> [Bytes]
+    [w_text_q5(),
+        w_text_q11(),
+        w_mixed_q11(),
+        w_random_q5(),
+        w_html_q11(),
+        w_stream_pieces(),
+        w_text_q1(),
+        w_text_q0(),
+        w_small_window(),
+        w_empty()]
+
+fn names() -> [Str]
+    ["text_q5",
+        "text_q11",
+        "mixed_q11",
+        "random_q5",
+        "html_q11",
+        "stream_pieces",
+        "text_q1",
+        "text_q0",
+        "small_window",
+        "empty"]
+
+fn roomy() -> BroLimits
+    BroLimits { max_window: 16777200, max_output: 0 }
+
+// Decode a stream by feeding `feed_size` bytes at a time into an output
+// buffer of `out_size` bytes, and answer what came out or the reason it
+// did not.
+fn stream_decode(src: Bytes, feed_size: Int, out_size: Int) -> Result<Bytes, Str>
+    match brotlidec.decoder(bytes.zeros(0), roomy())
+        Err(e) => Err(e.message())
+        Ok(d0) =>
+            var d = d0
+            var out = bytes.zeros(out_size)
+            var got = [] as [Bytes]
+            var fed = 0
+            var going = true
+            var why = ""
+            while going
+                match brotlidec.step(var d, var out, 0)
+                    BroProduced(n) =>
+                        got = list.push(got, bytes.slice(out, 0, n))
+                    BroDone        =>
+                        going = false
+                    BroWantsDrain  =>
+                        going = false
+                        why = "drain"
+                    BroNeedMore    =>
+                        if fed >= bytes.len(src)
+                            going = false
+                            why = "starved"
+                        else
+                            let k = if fed + feed_size > bytes.len(src)
+                                bytes.len(src) - fed
+                            else
+                                feed_size
+                            match brotlidec.feed(var d, bytes.slice(src, fed, fed + k))
+                                Ok(_)  =>
+                                    fed = fed + k
+                                Err(e) =>
+                                    going = false
+                                    why = e.message()
+            match brotlidec.fault_of(d)
+                Some(f) => Err(f.message())
+                None    =>
+                    if why == ""
+                        Ok(bytes.concat(got))
+                    else
+                        Err(why)
+
+@test
+fn test_every_reference_stream_decodes_to_its_input() [io]
+    let streams = all_streams()
+    let inputs = all_inputs()
+    let ns = names()
+    for i in 0..list.len(streams)
+        test.case("${ns[i]} in one call")
+        match brotlidec.decompress(streams[i], roomy())
+            Ok(b)  => test.assert(b == inputs[i])
+            Err(e) => test.fail(e.message())
+
+        test.case("${ns[i]}: the size can be had without keeping the bytes")
+        match brotlidec.decompressed_size(streams[i], roomy())
+            Ok(n)  => test.assert_eq(n, bytes.len(inputs[i]))
+            Err(e) => test.fail(e.message())
+
+@test
+fn test_the_stream_decoder_gives_the_same_bytes_however_it_is_fed() [io]
+    let streams = all_streams()
+    let inputs = all_inputs()
+    let ns = names()
+    for i in 0..list.len(streams)
+        for cfg in [[1, 1], [3, 7], [64, 100], [1000000, 65536]]
+            test.case("${ns[i]} fed ${cfg[0]} at a time into ${cfg[1]} bytes")
+            match stream_decode(streams[i], cfg[0], cfg[1])
+                Ok(b)  => test.assert(b == inputs[i])
+                Err(e) => test.fail(e)
+
+@test
+fn test_a_truncated_stream_is_refused_at_every_length() [io]
+    let streams = all_streams()
+    let ns = names()
+    for i in 0..list.len(streams)
+        let s = streams[i]
+        test.case("${ns[i]} cut short")
+        var wrong = 0
+        var refused = 0
+        var tried = 0
+        let step = if bytes.len(s) > 300
+            37
+        else
+            1
+        var cut = 0
+        while cut < bytes.len(s)
+            tried = tried + 1
+            match brotlidec.decompress(bytes.slice(s, 0, cut), roomy())
+                Ok(_)  =>
+                    wrong = wrong + 1
+                Err(_) =>
+                    refused = refused + 1
+            cut = cut + step
+        test.assert_eq(wrong, 0)
+        test.assert_eq(refused, tried)
+
+@test
+fn test_a_damaged_stream_is_decoded_or_refused_and_never_runs_away() [io]
+    let streams = all_streams()
+    let ns = names()
+    let limits = BroLimits { max_window: 16777200, max_output: 200000 }
+    for i in 0..list.len(streams)
+        test.case("${ns[i]} with one byte changed at a time")
+        let s = streams[i]
+        var survived = 0
+        var refused = 0
+        var at = 0
+        let stride = if bytes.len(s) > 400
+            23
+        else
+            1
+        while at < bytes.len(s)
+            for flip in [1, 128, 255]
+                var t = bytes.clone(s)
+                bytes.set_u8(t, at, (bytes.byte_at(t, at) ?? 0) ^ flip)
+                match brotlidec.decompress(t, limits)
+                    Ok(_)  =>
+                        survived = survived + 1
+                    Err(_) =>
+                        refused = refused + 1
+            at = at + stride
+        test.assert(survived + refused > 0)
+
+@test
+fn test_a_budget_is_a_refusal_and_not_a_crash() [io]
+    test.case("an output bound below the stream's size stops it at the byte it crossed")
+    let tight = BroLimits { max_window: 16777200, max_output: 1000 }
+    match brotlidec.decompress(v_text_q5(), tight)
+        Ok(_)  => test.fail("3000 bytes came out of a 1000 byte budget")
+        Err(e) =>
+            test.assert(brotlierror.is_budget(e))
+            test.assert(e.message() != "")
+
+    test.case("and so does asking only for the size")
+    match brotlidec.decompressed_size(v_text_q5(), tight)
+        Ok(_)  => test.fail("3000 bytes came out of a 1000 byte budget")
+        Err(e) => test.assert(brotlierror.is_budget(e))
+
+    test.case("a window past the budget is refused before any memory is spent")
+    let small = BroLimits { max_window: 4096, max_output: 0 }
+    match brotlidec.decoder(v_text_q11(), small)
+        Ok(_)  => test.fail("the stream wants a 4 MiB window")
+        Err(e) =>
+            match e
+                BroWindowTooLarge(want, limit) =>
+                    test.assert_eq(want, 4194288)
+                    test.assert_eq(limit, 4096)
+                _                              => test.fail("the refusal names the window")
+
+    test.case("a failed decoder says so, answers Done, and refuses more input")
+    match brotlidec.decoder(bytes.zeros(0), roomy())
+        Err(_) => test.fail("an empty head is not an error")
+        Ok(d0) =>
+            var d = d0
+            // A 16-bit window, then a metadata meta-block whose reserved bit is set.
+            let bad = bytes.from_byte_list([28, 0, 0, 0])
+            match brotlidec.feed(var d, bad)
+                Ok(_)  => test.assert(not brotlidec.is_failed(d))
+                Err(_) => test.fail("the fault is found by the step, not the feed")
+            var out = bytes.zeros(16)
+            match brotlidec.step(var d, var out, 0)
+                BroDone => test.assert(brotlidec.is_failed(d))
+                _       => test.fail("a failed decoder answers Done")
+            match brotlidec.fault_of(d)
+                Some(f) => test.assert_eq(f.message(), "brotli: the meta-block header at byte 0 has a bad reserved bit")
+                None    => test.fail("the fault is kept")
+            match brotlidec.feed(var d, bad)
+                Ok(_)  => test.fail("a failed decoder takes no more input")
+                Err(f) => test.assert(f.message() != "")

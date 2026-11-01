@@ -1,0 +1,1674 @@
+// brotli_edge_tests.nv — the small public functions of every module,
+// against the reference where there is one: the 121 transforms on seven
+// words, the context lookup, the dictionary's tables, and the headers and
+// prefix codes read out of bits packed here.
+
+use std.bytes
+use std.list
+use std.str
+use std.test
+use brotliblock
+use brotlicontext
+use brotlidec
+use brotlidict
+use brotlidist
+use brotlierror
+use brotliprefix
+use brotlistream
+
+// (length, index) of the words the transform table is checked on.
+const CHECK_WORDS: [[Int]] = [[7, 3], [4, 0], [5, 100], [24, 5], [10, 1000], [4, 939], [4, 527]]
+
+// The word each entry of CHECK_WORDS names, as hexadecimal.
+
+const CHECK_WORD_HEX: [Str] = ["68696d73656c66",
+    "74696d65",
+    "6f6674656e",
+    "696e70757420747970653d227465787422206e616d653d22",
+    "d985d8b4d8a7d983d984",
+    "d0b7d0b0",
+    "e2809973"]
+
+// For each word, the 121 transformed forms libbrotli produces, as hexadecimal.
+const CHECK_TRANSFORMED: [[Str]] = [["68696d73656c66",
+    "68696d73656c6620",
+    "2068696d73656c6620",
+    "696d73656c66",
+    "48696d73656c6620",
+    "68696d73656c662074686520",
+    "2068696d73656c66",
+    "732068696d73656c6620",
+    "68696d73656c66206f6620",
+    "48696d73656c66",
+    "68696d73656c6620616e6420",
+    "6d73656c66",
+    "68696d73656c",
+    "2c2068696d73656c6620",
+    "68696d73656c662c20",
+    "2048696d73656c6620",
+    "68696d73656c6620696e20",
+    "68696d73656c6620746f20",
+    "652068696d73656c6620",
+    "68696d73656c6622",
+    "68696d73656c662e",
+    "68696d73656c66223e",
+    "68696d73656c660a",
+    "68696d73",
+    "68696d73656c665d",
+    "68696d73656c6620666f7220",
+    "73656c66",
+    "68696d7365",
+    "68696d73656c66206120",
+    "68696d73656c66207468617420",
+    "2048696d73656c66",
+    "68696d73656c662e20",
+    "2e68696d73656c66",
+    "2068696d73656c662c20",
+    "656c66",
+    "68696d73656c66207769746820",
+    "68696d73656c6627",
+    "68696d73656c662066726f6d20",
+    "68696d73656c6620627920",
+    "6c66",
+    "66",
+    "207468652068696d73656c66",
+    "68696d",
+    "68696d73656c662e2054686520",
+    "48494d53454c46",
+    "68696d73656c66206f6e20",
+    "68696d73656c6620617320",
+    "68696d73656c6620697320",
+    "",
+    "68696d73656c696e6720",
+    "68696d73656c660a09",
+    "68696d73656c663a",
+    "2068696d73656c662e20",
+    "68696d73656c66656420",
+    "",
+    "",
+    "68",
+    "68696d73656c6628",
+    "48696d73656c662c20",
+    "",
+    "68696d73656c6620617420",
+    "68696d73656c666c7920",
+    "207468652068696d73656c66206f6620",
+    "6869",
+    "",
+    "2048696d73656c662c20",
+    "48696d73656c6622",
+    "2e68696d73656c6628",
+    "48494d53454c4620",
+    "48696d73656c66223e",
+    "68696d73656c663d22",
+    "2068696d73656c662e",
+    "2e636f6d2f68696d73656c66",
+    "207468652068696d73656c66206f662074686520",
+    "48696d73656c6627",
+    "68696d73656c662e205468697320",
+    "68696d73656c662c",
+    "2e68696d73656c6620",
+    "48696d73656c6628",
+    "48696d73656c662e",
+    "68696d73656c66206e6f7420",
+    "2068696d73656c663d22",
+    "68696d73656c66657220",
+    "2048494d53454c4620",
+    "68696d73656c66616c20",
+    "2048494d53454c46",
+    "68696d73656c663d27",
+    "48494d53454c4622",
+    "48696d73656c662e20",
+    "2068696d73656c6628",
+    "68696d73656c6666756c20",
+    "2048696d73656c662e20",
+    "68696d73656c6669766520",
+    "68696d73656c666c65737320",
+    "48494d53454c4627",
+    "68696d73656c6665737420",
+    "2048696d73656c662e",
+    "48494d53454c46223e",
+    "2068696d73656c663d27",
+    "48696d73656c662c",
+    "68696d73656c66697a6520",
+    "48494d53454c462e",
+    "c2a068696d73656c66",
+    "2068696d73656c662c",
+    "48696d73656c663d22",
+    "48494d53454c463d22",
+    "68696d73656c666f757320",
+    "48494d53454c462c20",
+    "48696d73656c663d27",
+    "2048696d73656c662c",
+    "2048494d53454c463d22",
+    "2048494d53454c462c20",
+    "48494d53454c462c",
+    "48494d53454c4628",
+    "48494d53454c462e20",
+    "2048494d53454c462e",
+    "48494d53454c463d27",
+    "2048494d53454c462e20",
+    "2048696d73656c663d22",
+    "2048494d53454c463d27",
+    "2048696d73656c663d27"],
+    ["74696d65",
+    "74696d6520",
+    "2074696d6520",
+    "696d65",
+    "54696d6520",
+    "74696d652074686520",
+    "2074696d65",
+    "732074696d6520",
+    "74696d65206f6620",
+    "54696d65",
+    "74696d6520616e6420",
+    "6d65",
+    "74696d",
+    "2c2074696d6520",
+    "74696d652c20",
+    "2054696d6520",
+    "74696d6520696e20",
+    "74696d6520746f20",
+    "652074696d6520",
+    "74696d6522",
+    "74696d652e",
+    "74696d65223e",
+    "74696d650a",
+    "74",
+    "74696d655d",
+    "74696d6520666f7220",
+    "65",
+    "7469",
+    "74696d65206120",
+    "74696d65207468617420",
+    "2054696d65",
+    "74696d652e20",
+    "2e74696d65",
+    "2074696d652c20",
+    "",
+    "74696d65207769746820",
+    "74696d6527",
+    "74696d652066726f6d20",
+    "74696d6520627920",
+    "",
+    "",
+    "207468652074696d65",
+    "",
+    "74696d652e2054686520",
+    "54494d45",
+    "74696d65206f6e20",
+    "74696d6520617320",
+    "74696d6520697320",
+    "",
+    "74696d696e6720",
+    "74696d650a09",
+    "74696d653a",
+    "2074696d652e20",
+    "74696d65656420",
+    "",
+    "",
+    "",
+    "74696d6528",
+    "54696d652c20",
+    "",
+    "74696d6520617420",
+    "74696d656c7920",
+    "207468652074696d65206f6620",
+    "",
+    "",
+    "2054696d652c20",
+    "54696d6522",
+    "2e74696d6528",
+    "54494d4520",
+    "54696d65223e",
+    "74696d653d22",
+    "2074696d652e",
+    "2e636f6d2f74696d65",
+    "207468652074696d65206f662074686520",
+    "54696d6527",
+    "74696d652e205468697320",
+    "74696d652c",
+    "2e74696d6520",
+    "54696d6528",
+    "54696d652e",
+    "74696d65206e6f7420",
+    "2074696d653d22",
+    "74696d65657220",
+    "2054494d4520",
+    "74696d65616c20",
+    "2054494d45",
+    "74696d653d27",
+    "54494d4522",
+    "54696d652e20",
+    "2074696d6528",
+    "74696d6566756c20",
+    "2054696d652e20",
+    "74696d6569766520",
+    "74696d656c65737320",
+    "54494d4527",
+    "74696d6565737420",
+    "2054696d652e",
+    "54494d45223e",
+    "2074696d653d27",
+    "54696d652c",
+    "74696d65697a6520",
+    "54494d452e",
+    "c2a074696d65",
+    "2074696d652c",
+    "54696d653d22",
+    "54494d453d22",
+    "74696d656f757320",
+    "54494d452c20",
+    "54696d653d27",
+    "2054696d652c",
+    "2054494d453d22",
+    "2054494d452c20",
+    "54494d452c",
+    "54494d4528",
+    "54494d452e20",
+    "2054494d452e",
+    "54494d453d27",
+    "2054494d452e20",
+    "2054696d653d22",
+    "2054494d453d27",
+    "2054696d653d27"],
+    ["6f6674656e",
+    "6f6674656e20",
+    "206f6674656e20",
+    "6674656e",
+    "4f6674656e20",
+    "6f6674656e2074686520",
+    "206f6674656e",
+    "73206f6674656e20",
+    "6f6674656e206f6620",
+    "4f6674656e",
+    "6f6674656e20616e6420",
+    "74656e",
+    "6f667465",
+    "2c206f6674656e20",
+    "6f6674656e2c20",
+    "204f6674656e20",
+    "6f6674656e20696e20",
+    "6f6674656e20746f20",
+    "65206f6674656e20",
+    "6f6674656e22",
+    "6f6674656e2e",
+    "6f6674656e223e",
+    "6f6674656e0a",
+    "6f66",
+    "6f6674656e5d",
+    "6f6674656e20666f7220",
+    "656e",
+    "6f6674",
+    "6f6674656e206120",
+    "6f6674656e207468617420",
+    "204f6674656e",
+    "6f6674656e2e20",
+    "2e6f6674656e",
+    "206f6674656e2c20",
+    "6e",
+    "6f6674656e207769746820",
+    "6f6674656e27",
+    "6f6674656e2066726f6d20",
+    "6f6674656e20627920",
+    "",
+    "",
+    "20746865206f6674656e",
+    "6f",
+    "6f6674656e2e2054686520",
+    "4f4654454e",
+    "6f6674656e206f6e20",
+    "6f6674656e20617320",
+    "6f6674656e20697320",
+    "",
+    "6f667465696e6720",
+    "6f6674656e0a09",
+    "6f6674656e3a",
+    "206f6674656e2e20",
+    "6f6674656e656420",
+    "",
+    "",
+    "",
+    "6f6674656e28",
+    "4f6674656e2c20",
+    "",
+    "6f6674656e20617420",
+    "6f6674656e6c7920",
+    "20746865206f6674656e206f6620",
+    "",
+    "",
+    "204f6674656e2c20",
+    "4f6674656e22",
+    "2e6f6674656e28",
+    "4f4654454e20",
+    "4f6674656e223e",
+    "6f6674656e3d22",
+    "206f6674656e2e",
+    "2e636f6d2f6f6674656e",
+    "20746865206f6674656e206f662074686520",
+    "4f6674656e27",
+    "6f6674656e2e205468697320",
+    "6f6674656e2c",
+    "2e6f6674656e20",
+    "4f6674656e28",
+    "4f6674656e2e",
+    "6f6674656e206e6f7420",
+    "206f6674656e3d22",
+    "6f6674656e657220",
+    "204f4654454e20",
+    "6f6674656e616c20",
+    "204f4654454e",
+    "6f6674656e3d27",
+    "4f4654454e22",
+    "4f6674656e2e20",
+    "206f6674656e28",
+    "6f6674656e66756c20",
+    "204f6674656e2e20",
+    "6f6674656e69766520",
+    "6f6674656e6c65737320",
+    "4f4654454e27",
+    "6f6674656e65737420",
+    "204f6674656e2e",
+    "4f4654454e223e",
+    "206f6674656e3d27",
+    "4f6674656e2c",
+    "6f6674656e697a6520",
+    "4f4654454e2e",
+    "c2a06f6674656e",
+    "206f6674656e2c",
+    "4f6674656e3d22",
+    "4f4654454e3d22",
+    "6f6674656e6f757320",
+    "4f4654454e2c20",
+    "4f6674656e3d27",
+    "204f6674656e2c",
+    "204f4654454e3d22",
+    "204f4654454e2c20",
+    "4f4654454e2c",
+    "4f4654454e28",
+    "4f4654454e2e20",
+    "204f4654454e2e",
+    "4f4654454e3d27",
+    "204f4654454e2e20",
+    "204f6674656e3d22",
+    "204f4654454e3d27",
+    "204f6674656e3d27"],
+    ["696e70757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d653d2220",
+    "20696e70757420747970653d227465787422206e616d653d2220",
+    "6e70757420747970653d227465787422206e616d653d22",
+    "496e70757420747970653d227465787422206e616d653d2220",
+    "696e70757420747970653d227465787422206e616d653d222074686520",
+    "20696e70757420747970653d227465787422206e616d653d22",
+    "7320696e70757420747970653d227465787422206e616d653d2220",
+    "696e70757420747970653d227465787422206e616d653d22206f6620",
+    "496e70757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d653d2220616e6420",
+    "70757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d653d",
+    "2c20696e70757420747970653d227465787422206e616d653d2220",
+    "696e70757420747970653d227465787422206e616d653d222c20",
+    "20496e70757420747970653d227465787422206e616d653d2220",
+    "696e70757420747970653d227465787422206e616d653d2220696e20",
+    "696e70757420747970653d227465787422206e616d653d2220746f20",
+    "6520696e70757420747970653d227465787422206e616d653d2220",
+    "696e70757420747970653d227465787422206e616d653d2222",
+    "696e70757420747970653d227465787422206e616d653d222e",
+    "696e70757420747970653d227465787422206e616d653d22223e",
+    "696e70757420747970653d227465787422206e616d653d220a",
+    "696e70757420747970653d227465787422206e616d",
+    "696e70757420747970653d227465787422206e616d653d225d",
+    "696e70757420747970653d227465787422206e616d653d2220666f7220",
+    "757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d65",
+    "696e70757420747970653d227465787422206e616d653d22206120",
+    "696e70757420747970653d227465787422206e616d653d22207468617420",
+    "20496e70757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d653d222e20",
+    "2e696e70757420747970653d227465787422206e616d653d22",
+    "20696e70757420747970653d227465787422206e616d653d222c20",
+    "7420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e616d653d22207769746820",
+    "696e70757420747970653d227465787422206e616d653d2227",
+    "696e70757420747970653d227465787422206e616d653d222066726f6d20",
+    "696e70757420747970653d227465787422206e616d653d2220627920",
+    "20747970653d227465787422206e616d653d22",
+    "747970653d227465787422206e616d653d22",
+    "2074686520696e70757420747970653d227465787422206e616d653d22",
+    "696e70757420747970653d227465787422206e61",
+    "696e70757420747970653d227465787422206e616d653d222e2054686520",
+    "494e50555420545950453d225445585422204e414d453d22",
+    "696e70757420747970653d227465787422206e616d653d22206f6e20",
+    "696e70757420747970653d227465787422206e616d653d2220617320",
+    "696e70757420747970653d227465787422206e616d653d2220697320",
+    "696e70757420747970653d227465787422",
+    "696e70757420747970653d227465787422206e616d653d696e6720",
+    "696e70757420747970653d227465787422206e616d653d220a09",
+    "696e70757420747970653d227465787422206e616d653d223a",
+    "20696e70757420747970653d227465787422206e616d653d222e20",
+    "696e70757420747970653d227465787422206e616d653d22656420",
+    "653d227465787422206e616d653d22",
+    "7970653d227465787422206e616d653d22",
+    "696e70757420747970653d22746578742220",
+    "696e70757420747970653d227465787422206e616d653d2228",
+    "496e70757420747970653d227465787422206e616d653d222c20",
+    "696e70757420747970653d2274657874",
+    "696e70757420747970653d227465787422206e616d653d2220617420",
+    "696e70757420747970653d227465787422206e616d653d226c7920",
+    "2074686520696e70757420747970653d227465787422206e616d653d22206f6620",
+    "696e70757420747970653d227465787422206e",
+    "696e70757420747970653d22746578",
+    "20496e70757420747970653d227465787422206e616d653d222c20",
+    "496e70757420747970653d227465787422206e616d653d2222",
+    "2e696e70757420747970653d227465787422206e616d653d2228",
+    "494e50555420545950453d225445585422204e414d453d2220",
+    "496e70757420747970653d227465787422206e616d653d22223e",
+    "696e70757420747970653d227465787422206e616d653d223d22",
+    "20696e70757420747970653d227465787422206e616d653d222e",
+    "2e636f6d2f696e70757420747970653d227465787422206e616d653d22",
+    "2074686520696e70757420747970653d227465787422206e616d653d22206f662074686520",
+    "496e70757420747970653d227465787422206e616d653d2227",
+    "696e70757420747970653d227465787422206e616d653d222e205468697320",
+    "696e70757420747970653d227465787422206e616d653d222c",
+    "2e696e70757420747970653d227465787422206e616d653d2220",
+    "496e70757420747970653d227465787422206e616d653d2228",
+    "496e70757420747970653d227465787422206e616d653d222e",
+    "696e70757420747970653d227465787422206e616d653d22206e6f7420",
+    "20696e70757420747970653d227465787422206e616d653d223d22",
+    "696e70757420747970653d227465787422206e616d653d22657220",
+    "20494e50555420545950453d225445585422204e414d453d2220",
+    "696e70757420747970653d227465787422206e616d653d22616c20",
+    "20494e50555420545950453d225445585422204e414d453d22",
+    "696e70757420747970653d227465787422206e616d653d223d27",
+    "494e50555420545950453d225445585422204e414d453d2222",
+    "496e70757420747970653d227465787422206e616d653d222e20",
+    "20696e70757420747970653d227465787422206e616d653d2228",
+    "696e70757420747970653d227465787422206e616d653d2266756c20",
+    "20496e70757420747970653d227465787422206e616d653d222e20",
+    "696e70757420747970653d227465787422206e616d653d2269766520",
+    "696e70757420747970653d227465787422206e616d653d226c65737320",
+    "494e50555420545950453d225445585422204e414d453d2227",
+    "696e70757420747970653d227465787422206e616d653d2265737420",
+    "20496e70757420747970653d227465787422206e616d653d222e",
+    "494e50555420545950453d225445585422204e414d453d22223e",
+    "20696e70757420747970653d227465787422206e616d653d223d27",
+    "496e70757420747970653d227465787422206e616d653d222c",
+    "696e70757420747970653d227465787422206e616d653d22697a6520",
+    "494e50555420545950453d225445585422204e414d453d222e",
+    "c2a0696e70757420747970653d227465787422206e616d653d22",
+    "20696e70757420747970653d227465787422206e616d653d222c",
+    "496e70757420747970653d227465787422206e616d653d223d22",
+    "494e50555420545950453d225445585422204e414d453d223d22",
+    "696e70757420747970653d227465787422206e616d653d226f757320",
+    "494e50555420545950453d225445585422204e414d453d222c20",
+    "496e70757420747970653d227465787422206e616d653d223d27",
+    "20496e70757420747970653d227465787422206e616d653d222c",
+    "20494e50555420545950453d225445585422204e414d453d223d22",
+    "20494e50555420545950453d225445585422204e414d453d222c20",
+    "494e50555420545950453d225445585422204e414d453d222c",
+    "494e50555420545950453d225445585422204e414d453d2228",
+    "494e50555420545950453d225445585422204e414d453d222e20",
+    "20494e50555420545950453d225445585422204e414d453d222e",
+    "494e50555420545950453d225445585422204e414d453d223d27",
+    "20494e50555420545950453d225445585422204e414d453d222e20",
+    "20496e70757420747970653d227465787422206e616d653d223d22",
+    "20494e50555420545950453d225445585422204e414d453d223d27",
+    "20496e70757420747970653d227465787422206e616d653d223d27"],
+    ["d985d8b4d8a7d983d984",
+    "d985d8b4d8a7d983d98420",
+    "20d985d8b4d8a7d983d98420",
+    "85d8b4d8a7d983d984",
+    "d9a5d8b4d8a7d983d98420",
+    "d985d8b4d8a7d983d9842074686520",
+    "20d985d8b4d8a7d983d984",
+    "7320d985d8b4d8a7d983d98420",
+    "d985d8b4d8a7d983d984206f6620",
+    "d9a5d8b4d8a7d983d984",
+    "d985d8b4d8a7d983d98420616e6420",
+    "d8b4d8a7d983d984",
+    "d985d8b4d8a7d983d9",
+    "2c20d985d8b4d8a7d983d98420",
+    "d985d8b4d8a7d983d9842c20",
+    "20d9a5d8b4d8a7d983d98420",
+    "d985d8b4d8a7d983d98420696e20",
+    "d985d8b4d8a7d983d98420746f20",
+    "6520d985d8b4d8a7d983d98420",
+    "d985d8b4d8a7d983d98422",
+    "d985d8b4d8a7d983d9842e",
+    "d985d8b4d8a7d983d984223e",
+    "d985d8b4d8a7d983d9840a",
+    "d985d8b4d8a7d9",
+    "d985d8b4d8a7d983d9845d",
+    "d985d8b4d8a7d983d98420666f7220",
+    "b4d8a7d983d984",
+    "d985d8b4d8a7d983",
+    "d985d8b4d8a7d983d984206120",
+    "d985d8b4d8a7d983d984207468617420",
+    "20d9a5d8b4d8a7d983d984",
+    "d985d8b4d8a7d983d9842e20",
+    "2ed985d8b4d8a7d983d984",
+    "20d985d8b4d8a7d983d9842c20",
+    "d8a7d983d984",
+    "d985d8b4d8a7d983d984207769746820",
+    "d985d8b4d8a7d983d98427",
+    "d985d8b4d8a7d983d9842066726f6d20",
+    "d985d8b4d8a7d983d98420627920",
+    "a7d983d984",
+    "d983d984",
+    "2074686520d985d8b4d8a7d983d984",
+    "d985d8b4d8a7",
+    "d985d8b4d8a7d983d9842e2054686520",
+    "d9a5d894d887d9a3d9a4",
+    "d985d8b4d8a7d983d984206f6e20",
+    "d985d8b4d8a7d983d98420617320",
+    "d985d8b4d8a7d983d98420697320",
+    "d985d8",
+    "d985d8b4d8a7d983d9696e6720",
+    "d985d8b4d8a7d983d9840a09",
+    "d985d8b4d8a7d983d9843a",
+    "20d985d8b4d8a7d983d9842e20",
+    "d985d8b4d8a7d983d984656420",
+    "84",
+    "83d984",
+    "d985d8b4",
+    "d985d8b4d8a7d983d98428",
+    "d9a5d8b4d8a7d983d9842c20",
+    "d985",
+    "d985d8b4d8a7d983d98420617420",
+    "d985d8b4d8a7d983d9846c7920",
+    "2074686520d985d8b4d8a7d983d984206f6620",
+    "d985d8b4d8",
+    "d9",
+    "20d9a5d8b4d8a7d983d9842c20",
+    "d9a5d8b4d8a7d983d98422",
+    "2ed985d8b4d8a7d983d98428",
+    "d9a5d894d887d9a3d9a420",
+    "d9a5d8b4d8a7d983d984223e",
+    "d985d8b4d8a7d983d9843d22",
+    "20d985d8b4d8a7d983d9842e",
+    "2e636f6d2fd985d8b4d8a7d983d984",
+    "2074686520d985d8b4d8a7d983d984206f662074686520",
+    "d9a5d8b4d8a7d983d98427",
+    "d985d8b4d8a7d983d9842e205468697320",
+    "d985d8b4d8a7d983d9842c",
+    "2ed985d8b4d8a7d983d98420",
+    "d9a5d8b4d8a7d983d98428",
+    "d9a5d8b4d8a7d983d9842e",
+    "d985d8b4d8a7d983d984206e6f7420",
+    "20d985d8b4d8a7d983d9843d22",
+    "d985d8b4d8a7d983d984657220",
+    "20d9a5d894d887d9a3d9a420",
+    "d985d8b4d8a7d983d984616c20",
+    "20d9a5d894d887d9a3d9a4",
+    "d985d8b4d8a7d983d9843d27",
+    "d9a5d894d887d9a3d9a422",
+    "d9a5d8b4d8a7d983d9842e20",
+    "20d985d8b4d8a7d983d98428",
+    "d985d8b4d8a7d983d98466756c20",
+    "20d9a5d8b4d8a7d983d9842e20",
+    "d985d8b4d8a7d983d98469766520",
+    "d985d8b4d8a7d983d9846c65737320",
+    "d9a5d894d887d9a3d9a427",
+    "d985d8b4d8a7d983d98465737420",
+    "20d9a5d8b4d8a7d983d9842e",
+    "d9a5d894d887d9a3d9a4223e",
+    "20d985d8b4d8a7d983d9843d27",
+    "d9a5d8b4d8a7d983d9842c",
+    "d985d8b4d8a7d983d984697a6520",
+    "d9a5d894d887d9a3d9a42e",
+    "c2a0d985d8b4d8a7d983d984",
+    "20d985d8b4d8a7d983d9842c",
+    "d9a5d8b4d8a7d983d9843d22",
+    "d9a5d894d887d9a3d9a43d22",
+    "d985d8b4d8a7d983d9846f757320",
+    "d9a5d894d887d9a3d9a42c20",
+    "d9a5d8b4d8a7d983d9843d27",
+    "20d9a5d8b4d8a7d983d9842c",
+    "20d9a5d894d887d9a3d9a43d22",
+    "20d9a5d894d887d9a3d9a42c20",
+    "d9a5d894d887d9a3d9a42c",
+    "d9a5d894d887d9a3d9a428",
+    "d9a5d894d887d9a3d9a42e20",
+    "20d9a5d894d887d9a3d9a42e",
+    "d9a5d894d887d9a3d9a43d27",
+    "20d9a5d894d887d9a3d9a42e20",
+    "20d9a5d8b4d8a7d983d9843d22",
+    "20d9a5d894d887d9a3d9a43d27",
+    "20d9a5d8b4d8a7d983d9843d27"],
+    ["d0b7d0b0",
+    "d0b7d0b020",
+    "20d0b7d0b020",
+    "b7d0b0",
+    "d097d0b020",
+    "d0b7d0b02074686520",
+    "20d0b7d0b0",
+    "7320d0b7d0b020",
+    "d0b7d0b0206f6620",
+    "d097d0b0",
+    "d0b7d0b020616e6420",
+    "d0b0",
+    "d0b7d0",
+    "2c20d0b7d0b020",
+    "d0b7d0b02c20",
+    "20d097d0b020",
+    "d0b7d0b020696e20",
+    "d0b7d0b020746f20",
+    "6520d0b7d0b020",
+    "d0b7d0b022",
+    "d0b7d0b02e",
+    "d0b7d0b0223e",
+    "d0b7d0b00a",
+    "d0",
+    "d0b7d0b05d",
+    "d0b7d0b020666f7220",
+    "b0",
+    "d0b7",
+    "d0b7d0b0206120",
+    "d0b7d0b0207468617420",
+    "20d097d0b0",
+    "d0b7d0b02e20",
+    "2ed0b7d0b0",
+    "20d0b7d0b02c20",
+    "",
+    "d0b7d0b0207769746820",
+    "d0b7d0b027",
+    "d0b7d0b02066726f6d20",
+    "d0b7d0b020627920",
+    "",
+    "",
+    "2074686520d0b7d0b0",
+    "",
+    "d0b7d0b02e2054686520",
+    "d097d090",
+    "d0b7d0b0206f6e20",
+    "d0b7d0b020617320",
+    "d0b7d0b020697320",
+    "",
+    "d0b7d0696e6720",
+    "d0b7d0b00a09",
+    "d0b7d0b03a",
+    "20d0b7d0b02e20",
+    "d0b7d0b0656420",
+    "",
+    "",
+    "",
+    "d0b7d0b028",
+    "d097d0b02c20",
+    "",
+    "d0b7d0b020617420",
+    "d0b7d0b06c7920",
+    "2074686520d0b7d0b0206f6620",
+    "",
+    "",
+    "20d097d0b02c20",
+    "d097d0b022",
+    "2ed0b7d0b028",
+    "d097d09020",
+    "d097d0b0223e",
+    "d0b7d0b03d22",
+    "20d0b7d0b02e",
+    "2e636f6d2fd0b7d0b0",
+    "2074686520d0b7d0b0206f662074686520",
+    "d097d0b027",
+    "d0b7d0b02e205468697320",
+    "d0b7d0b02c",
+    "2ed0b7d0b020",
+    "d097d0b028",
+    "d097d0b02e",
+    "d0b7d0b0206e6f7420",
+    "20d0b7d0b03d22",
+    "d0b7d0b0657220",
+    "20d097d09020",
+    "d0b7d0b0616c20",
+    "20d097d090",
+    "d0b7d0b03d27",
+    "d097d09022",
+    "d097d0b02e20",
+    "20d0b7d0b028",
+    "d0b7d0b066756c20",
+    "20d097d0b02e20",
+    "d0b7d0b069766520",
+    "d0b7d0b06c65737320",
+    "d097d09027",
+    "d0b7d0b065737420",
+    "20d097d0b02e",
+    "d097d090223e",
+    "20d0b7d0b03d27",
+    "d097d0b02c",
+    "d0b7d0b0697a6520",
+    "d097d0902e",
+    "c2a0d0b7d0b0",
+    "20d0b7d0b02c",
+    "d097d0b03d22",
+    "d097d0903d22",
+    "d0b7d0b06f757320",
+    "d097d0902c20",
+    "d097d0b03d27",
+    "20d097d0b02c",
+    "20d097d0903d22",
+    "20d097d0902c20",
+    "d097d0902c",
+    "d097d09028",
+    "d097d0902e20",
+    "20d097d0902e",
+    "d097d0903d27",
+    "20d097d0902e20",
+    "20d097d0b03d22",
+    "20d097d0903d27",
+    "20d097d0b03d27"],
+    ["e2809973",
+    "e280997320",
+    "20e280997320",
+    "809973",
+    "e2809c7320",
+    "e28099732074686520",
+    "20e2809973",
+    "7320e280997320",
+    "e2809973206f6620",
+    "e2809c73",
+    "e280997320616e6420",
+    "9973",
+    "e28099",
+    "2c20e280997320",
+    "e28099732c20",
+    "20e2809c7320",
+    "e280997320696e20",
+    "e280997320746f20",
+    "6520e280997320",
+    "e280997322",
+    "e28099732e",
+    "e2809973223e",
+    "e28099730a",
+    "e2",
+    "e28099735d",
+    "e280997320666f7220",
+    "73",
+    "e280",
+    "e2809973206120",
+    "e2809973207468617420",
+    "20e2809c73",
+    "e28099732e20",
+    "2ee2809973",
+    "20e28099732c20",
+    "",
+    "e2809973207769746820",
+    "e280997327",
+    "e28099732066726f6d20",
+    "e280997320627920",
+    "",
+    "",
+    "2074686520e2809973",
+    "",
+    "e28099732e2054686520",
+    "e2809c53",
+    "e2809973206f6e20",
+    "e280997320617320",
+    "e280997320697320",
+    "",
+    "e28099696e6720",
+    "e28099730a09",
+    "e28099733a",
+    "20e28099732e20",
+    "e2809973656420",
+    "",
+    "",
+    "",
+    "e280997328",
+    "e2809c732c20",
+    "",
+    "e280997320617420",
+    "e28099736c7920",
+    "2074686520e2809973206f6620",
+    "",
+    "",
+    "20e2809c732c20",
+    "e2809c7322",
+    "2ee280997328",
+    "e2809c5320",
+    "e2809c73223e",
+    "e28099733d22",
+    "20e28099732e",
+    "2e636f6d2fe2809973",
+    "2074686520e2809973206f662074686520",
+    "e2809c7327",
+    "e28099732e205468697320",
+    "e28099732c",
+    "2ee280997320",
+    "e2809c7328",
+    "e2809c732e",
+    "e2809973206e6f7420",
+    "20e28099733d22",
+    "e2809973657220",
+    "20e2809c5320",
+    "e2809973616c20",
+    "20e2809c53",
+    "e28099733d27",
+    "e2809c5322",
+    "e2809c732e20",
+    "20e280997328",
+    "e280997366756c20",
+    "20e2809c732e20",
+    "e280997369766520",
+    "e28099736c65737320",
+    "e2809c5327",
+    "e280997365737420",
+    "20e2809c732e",
+    "e2809c53223e",
+    "20e28099733d27",
+    "e2809c732c",
+    "e2809973697a6520",
+    "e2809c532e",
+    "c2a0e2809973",
+    "20e28099732c",
+    "e2809c733d22",
+    "e2809c533d22",
+    "e28099736f757320",
+    "e2809c532c20",
+    "e2809c733d27",
+    "20e2809c732c",
+    "20e2809c533d22",
+    "20e2809c532c20",
+    "e2809c532c",
+    "e2809c5328",
+    "e2809c532e20",
+    "20e2809c532e",
+    "e2809c533d27",
+    "20e2809c532e20",
+    "20e2809c733d22",
+    "20e2809c533d27",
+    "20e2809c733d27"]]
+
+const REF_OFFSETS: [Int] = [0,
+    4096,
+    9216,
+    21504,
+    35840,
+    44032,
+    53248,
+    63488,
+    74752,
+    87040,
+    93696,
+    100864,
+    104704,
+    106752,
+    108928,
+    113536,
+    115968,
+    118528,
+    119872,
+    121280,
+    122016]
+
+const REF_BITS: [Int] = [10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5, 5]
+
+// p1, p2 and the four contexts libbrotli computes for them.
+const CONTEXTS: [[Int]] = [[130, 183, 2, 32, 0, 36],
+    [14, 238, 14, 3, 2, 13],
+    [127, 26, 63, 31, 0, 26],
+    [80, 57, 16, 20, 54, 26],
+    [190, 240, 62, 47, 2, 38],
+    [126, 194, 62, 31, 12, 29],
+    [52, 127, 52, 13, 44, 19],
+    [6, 110, 6, 1, 3, 11],
+    [208, 143, 16, 52, 2, 44],
+    [93, 199, 29, 23, 28, 29],
+    [81, 36, 17, 20, 53, 26],
+    [71, 227, 7, 17, 54, 29],
+    [64, 67, 0, 16, 14, 27],
+    [0, 2, 0, 0, 0, 1],
+    [107, 110, 43, 26, 63, 27],
+    [84, 85, 20, 21, 54, 27],
+    [148, 160, 20, 37, 0, 36],
+    [101, 104, 37, 25, 59, 27],
+    [93, 100, 29, 23, 31, 27],
+    [196, 152, 4, 49, 2, 44],
+    [11, 184, 11, 2, 0, 12],
+    [212, 84, 20, 53, 2, 43],
+    [74, 135, 10, 18, 52, 28],
+    [33, 169, 33, 8, 12, 20],
+    [154, 1, 26, 38, 0, 33],
+    [173, 33, 45, 43, 1, 34],
+    [158, 181, 30, 39, 0, 36],
+    [156, 246, 28, 39, 2, 38],
+    [161, 94, 33, 40, 1, 35],
+    [246, 241, 54, 61, 2, 54],
+    [90, 29, 26, 22, 52, 26],
+    [131, 11, 3, 32, 1, 33],
+    [183, 206, 55, 45, 1, 37],
+    [9, 214, 9, 2, 4, 13],
+    [187, 192, 59, 46, 1, 37],
+    [4, 231, 4, 1, 2, 13],
+    [23, 92, 23, 5, 1, 19],
+    [100, 60, 36, 25, 61, 26],
+    [125, 236, 61, 31, 30, 29],
+    [176, 181, 48, 44, 0, 36],
+    [0, 0, 0, 0, 0, 0],
+    [255, 255, 63, 63, 3, 63],
+    [32, 65, 32, 8, 10, 19],
+    [97, 128, 33, 24, 56, 28],
+    [200, 15, 8, 50, 2, 41]]
+
+// Pack (value, width) fields least significant bit first, the way the
+// format is written.
+fn pack(fields: [[Int]]) -> Bytes
+    var out = [] as [Int]
+    var acc = 0
+    var n = 0
+    for f in fields
+        acc = acc | ((f[0] & ((1 << f[1]) - 1)) << n)
+        n = n + f[1]
+        while n >= 8
+            out = list.push(out, acc & 255)
+            acc = acc >> 8
+            n = n - 8
+    if n > 0
+        out = list.push(out, acc & 255)
+    bytes.from_byte_list(out)
+
+fn hex_of(r: Result<Bytes, BroFault>) -> Str
+    match r
+        Ok(b)  => bytes.to_hex(b)
+        Err(e) => e.message()
+
+// ── The dictionary ───────────────────────────────────────────────────
+
+@test
+fn test_the_seven_checked_words_are_where_the_reference_has_them() [io]
+    for k in 0..list.len(CHECK_WORDS)
+        let w = CHECK_WORDS[k]
+        test.case("word of length ${w[0]} at index ${w[1]}")
+        test.assert_eq(hex_of(brotlidict.word(w[0], w[1])), CHECK_WORD_HEX[k])
+
+@test
+fn test_all_121_transforms_of_each_checked_word_match_the_reference() [io]
+    for k in 0..list.len(CHECK_WORDS)
+        let w = CHECK_WORDS[k]
+        var wrong = 0
+        var wrong_len = 0
+        for id in 0..121
+            if hex_of(brotlidict.transformed(w[0], w[1], id)) != CHECK_TRANSFORMED[k][id]
+                wrong = wrong + 1
+            if brotlidict.transformed_len(w[0], id) != str.len(CHECK_TRANSFORMED[k][id]) / 2
+                wrong_len = wrong_len + 1
+        test.case("word ${k}: the bytes of every transform")
+        test.assert_eq(wrong, 0)
+        test.case("word ${k}: and the length each one has")
+        test.assert_eq(wrong_len, 0)
+
+@test
+fn test_the_dictionary_tables_match_the_reference() [io]
+    var total = 0
+    for l in 4..25
+        test.case("length ${l}")
+        test.assert_eq(brotlidict.offset_of_length(l), REF_OFFSETS[l - 4])
+        test.assert_eq(brotlidict.index_bits(l), REF_BITS[l - 4])
+        test.assert_eq(brotlidict.words_of_length(l), 1 << REF_BITS[l - 4])
+        test.assert(brotlidict.max_transformed_len(l) >= l)
+        total = total + brotlidict.words_of_length(l)
+    test.assert_eq(total, brotlidict.word_count())
+    test.assert_eq(brotlidict.offset_of_length(25), 122784)
+    test.assert_eq(brotlidict.index_bits(3), 0)
+    test.assert_eq(brotlidict.index_bits(25), 0)
+    test.assert_eq(bytes.len(brotlidict.dictionary_data()), brotlidict.dictionary_bytes())
+
+@test
+fn test_the_transform_table_has_the_kinds_the_format_defines() [io]
+    var kinds = [0, 0, 0, 0, 0]
+    for id in 0..121
+        match brotlidict.transform(id)
+            Err(_) => test.fail("every id below 121 is a transform")
+            Ok(t)  =>
+                let slot = match t.kind
+                    BroIdentity   => 0
+                    BroOmitFirst  => 1
+                    BroOmitLast   => 2
+                    BroFerment    => 3
+                    BroFermentAll => 4
+                kinds[slot] = kinds[slot] + 1
+                if t.kind == BroOmitFirst or t.kind == BroOmitLast
+                    test.assert(t.omit >= 1 and t.omit <= 9)
+                else
+                    test.assert_eq(t.omit, 0)
+    test.assert_eq(kinds[0], 64)
+    test.assert_eq(kinds[1], 8)
+    test.assert_eq(kinds[2], 10)
+    test.assert_eq(kinds[3], 20)
+    test.assert_eq(kinds[4], 19)
+    test.case("the two HTML transforms are where common_html_transforms says")
+    match brotlidict.transform(brotlidict.common_html_transforms()[0])
+        Ok(t)  =>
+            test.assert_eq(bytes.to_hex(t.prefix), "20")
+            test.assert_eq(bytes.len(t.suffix), 0)
+        Err(_) => test.fail("a transform")
+    match brotlidict.transform(brotlidict.common_html_transforms()[1])
+        Ok(t)  => test.assert_eq(bytes.to_hex(t.suffix), "223e")
+        Err(_) => test.fail("a transform")
+
+@test
+fn test_a_transform_or_a_word_that_is_not_there_is_refused_by_name() [io]
+    test.assert_eq(hex_of(brotlidict.transformed(4, 0, 121)), "brotli: transform 121 is not in the table of 121")
+    test.assert_eq(hex_of(brotlidict.transformed(4, 0, 0 - 1)), "brotli: transform -1 is not in the table of 121")
+    test.assert_eq(hex_of(brotlidict.transformed(3, 0, 0)),
+        "brotli: the dictionary has no word of length 3 at index 0")
+    test.assert_eq(hex_of(brotlidict.transformed(4, 1024, 0)),
+        "brotli: the dictionary has no word of length 4 at index 1024")
+    test.assert_eq(brotlidict.transformed_len(4, 121), 0)
+    test.assert_eq(brotlidict.transformed_len(4, 0 - 1), 0)
+    test.assert(not brotlidict.transform_changes_word(121))
+    test.assert(brotlidict.transform_changes_word(4))
+    match brotlidict.transform(0 - 1)
+        Ok(_)  => test.fail("no transform below 0")
+        Err(e) => test.assert(brotlierror.fault_at(e) == 0 - 1)
+
+// ── Contexts ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_four_context_modes_match_the_reference_lookup() [io]
+    var wrong = 0
+    for row in CONTEXTS
+        if brotlicontext.literal_context(BroLsb6, row[0], row[1]) != row[2]
+            wrong = wrong + 1
+        if brotlicontext.literal_context(BroMsb6, row[0], row[1]) != row[3]
+            wrong = wrong + 1
+        if brotlicontext.literal_context(BroUtf8, row[0], row[1]) != row[4]
+            wrong = wrong + 1
+        if brotlicontext.literal_context(BroSigned, row[0], row[1]) != row[5]
+            wrong = wrong + 1
+    test.assert_eq(wrong, 0)
+
+@test
+fn test_the_context_helpers_answer_at_their_edges() [io]
+    test.case("modes by number")
+    test.assert(brotlicontext.mode_of(1) == Ok(BroMsb6))
+    test.assert(brotlicontext.mode_of(3) == Ok(BroSigned))
+    match brotlicontext.mode_of(0 - 1)
+        Ok(_)  => test.fail("no mode below 0")
+        Err(e) => test.assert(brotlierror.fault_at(e) == 0 - 1 or brotlierror.fault_at(e) == 0)
+
+    test.case("the distance context clamps the copy length")
+    test.assert_eq(brotlicontext.distance_context(0), 0)
+    test.assert_eq(brotlicontext.distance_context(1), 0)
+    test.assert_eq(brotlicontext.distance_context(4), 2)
+    test.assert_eq(brotlicontext.distance_context(5), 3)
+
+    test.case("a map answers 0 outside itself and says when an entry is past the trees")
+    let m = BroContextMap { tree_of: [0, 1, 2], tree_count: 3, used_mtf: false, bits: 7 }
+    test.assert_eq(brotlicontext.tree_for(m, 0, 1, 64), 1)
+    test.assert_eq(brotlicontext.tree_for(m, 9, 9, 64), 0)
+    test.assert_eq(brotlicontext.tree_for(m, 0 - 1, 0, 64), 0)
+    test.assert_eq(brotlicontext.map_bits(m), 7)
+    test.assert(brotlicontext.map_is_sound(m))
+    test.assert(not brotlicontext.map_is_sound(BroContextMap { tree_of: [0, 3], tree_count: 3, used_mtf: false, bits: 0 }))
+    test.assert(not brotlicontext.map_is_sound(BroContextMap { tree_of: [0 - 1], tree_count: 3, used_mtf: false, bits: 0 }))
+
+    test.case("the inverse move-to-front keeps an index inside the table")
+    test.assert(brotlicontext.inverse_mtf([0 - 5, 300]) == [0, 255])
+    test.assert(brotlicontext.inverse_mtf([2, 2, 2]) == [2, 1, 0])
+
+@test
+fn test_a_context_map_is_read_with_and_without_the_move_to_front() [io]
+    // RLEMAX 0, a simple code over two symbols, four entries, the MTF flag.
+    let plain = pack([[0, 1], [1, 2], [1, 2], [0, 1], [1, 1], [0, 1], [1, 1], [1, 1], [0, 1], [0, 1]])
+    match brotlicontext.read_map(plain, 0, 4, 2)
+        Ok(m)  =>
+            test.assert(m.tree_of == [0, 1, 1, 0])
+            test.assert(not m.used_mtf)
+            test.assert_eq(brotlicontext.map_bits(m), 12)
+        Err(e) => test.fail(e.message())
+    let moved = pack([[0, 1], [1, 2], [1, 2], [0, 1], [1, 1], [0, 1], [1, 1], [1, 1], [0, 1], [1, 1]])
+    match brotlicontext.read_map(moved, 0, 4, 2)
+        Ok(m)  =>
+            test.assert(m.tree_of == [0, 1, 0, 0])
+            test.assert(m.used_mtf)
+        Err(e) => test.fail(e.message())
+    test.case("a map cut short is truncated, not guessed")
+    match brotlicontext.read_map(bytes.slice(plain, 0, 1), 0, 4, 2)
+        Ok(_)  => test.fail("half a map")
+        Err(e) => test.assert(brotlierror.fault_at(e) >= 0)
+
+// ── The stream header and the bit reader ─────────────────────────────
+
+fn header_of(b: Bytes) -> Str
+    match brotlistream.parse_header(b, brotlistream.default_limits())
+        Ok(h)  => "${h.window_bits} ${h.window_size} ${h.header_bits} ${h.large_window}"
+        Err(e) => e.message()
+
+@test
+fn test_the_window_field_is_read_in_all_its_spellings() [io]
+    test.case("one bit for 16, seven for 17, four for 18 to 24, seven for 10 to 15")
+    test.assert_eq(header_of(pack([[0, 1]])), "16 65520 1 false")
+    test.assert_eq(header_of(pack([[1, 1], [0, 3], [0, 3]])), "17 131056 7 false")
+    test.assert_eq(header_of(pack([[1, 1], [1, 3]])), "18 262128 4 false")
+    test.assert_eq(header_of(pack([[1, 1], [7, 3]])), "24 16777200 4 false")
+    test.assert_eq(header_of(pack([[1, 1], [0, 3], [2, 3]])), "10 1008 7 false")
+    test.assert_eq(header_of(pack([[1, 1], [0, 3], [7, 3]])), "15 32752 7 false")
+
+    test.case("the reserved spelling, which the large-window extension uses, is refused")
+    test.assert_eq(header_of(pack([[1, 1], [0, 3], [1, 3]])), "brotli: the window bits field 1 is not defined")
+
+    test.case("a header cut short is truncated and says where")
+    test.assert_eq(header_of(bytes.zeros(0)), "brotli: the stream ends at byte 0 and 1 more bits were needed")
+
+    test.case("a window past the budget carries both numbers")
+    match brotlistream.parse_header(pack([[1, 1], [7, 3]]), brotlistream.small_limits())
+        Ok(_)  => test.fail("24 bits is past the small budget")
+        Err(e) => test.assert_eq(e.message(),
+            "brotli: the stream asks for a window of 16777200 bytes and the limit is 4194304")
+
+@test
+fn test_the_bit_reader_reads_across_bytes_and_flags_the_end() [io]
+    let src = bytes.from_byte_list([0xAB, 0xCD, 0xEF])
+    var r = brotlistream.reader(src, 0)
+    test.assert_eq(brotlistream.read_bits(var r, 4), 0xB)
+    test.assert_eq(brotlistream.read_bits(var r, 12), 0xCDA)
+    test.assert_eq(brotlistream.bits_left(r), 8)
+    test.assert(not r.over)
+    test.assert_eq(brotlistream.peek_bits(r, 8), 0xEF)
+    test.assert_eq(brotlistream.read_bits(var r, 24), 0xEF)
+    test.assert(r.over)
+    test.assert_eq(brotlistream.bits_left(r), 0)
+
+    test.case("a reader in the last bytes still sees the bits that are there")
+    let tail = brotlistream.reader(src, 20)
+    test.assert_eq(brotlistream.peek_bits(tail, 4), 0xE)
+
+    test.case("align skips to a byte boundary and says whether it skipped zeros")
+    var a = brotlistream.reader(bytes.from_byte_list([0x05, 0xFF]), 0)
+    brotlistream.skip_bits(var a, 3)
+    test.assert(brotlistream.align(var a))
+    test.assert_eq(a.pos, 8)
+    var b = brotlistream.reader(bytes.from_byte_list([0x25, 0xFF]), 0)
+    brotlistream.skip_bits(var b, 3)
+    test.assert(not brotlistream.align(var b))
+    var c = brotlistream.reader(bytes.from_byte_list([0xFF]), 0)
+    brotlistream.skip_bits(var c, 8)
+    test.assert(brotlistream.align(var c))
+
+@test
+fn test_the_format_heuristic_rules_out_other_formats_and_text() [io]
+    test.case("other formats' signatures")
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_byte_list([31, 139, 8, 0])))
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_byte_list([80, 75, 3, 4])))
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_byte_list([40, 181, 47, 253])))
+    test.assert(not brotlistream.looks_like_brotli(bytes.zeros(0)))
+
+    test.case("plain text")
+    test.assert(not brotlistream.looks_like_brotli(bytes.from_str("hello, this is plain text\n")))
+
+    test.case("the reserved window spelling, a reserved bit, and streams that start well")
+    test.assert(not brotlistream.looks_like_brotli(pack([[1, 1], [0, 3], [1, 3], [0, 8], [0, 8]])))
+    test.assert(not brotlistream.looks_like_brotli(pack([[0, 1], [0, 1], [3, 2], [1, 1], [0, 8], [0, 8]])))
+    test.assert(brotlistream.looks_like_brotli(brotlistream.empty_stream()))
+    test.assert(brotlistream.looks_like_brotli(pack([[0, 1], [0, 1], [3, 2], [0, 1], [0, 8], [0, 8]])))
+    test.assert(brotlistream.looks_like_brotli(pack([[0, 1], [0, 1], [0, 2], [0, 16], [0, 16]])))
+    test.assert(not brotlistream.looks_like_brotli(pack([[0, 1], [1, 1], [1, 1], [0, 1], [0, 8], [0, 8], [0, 8]])))
+
+// ── Prefix codes ─────────────────────────────────────────────────────
+
+@test
+fn test_a_code_built_from_lengths_is_complete_or_single() [io]
+    test.case("complete codes")
+    match brotliprefix.of_lengths([1, 2, 2])
+        Ok(p)  =>
+            test.assert_eq(brotliprefix.live_symbols(p), 3)
+            test.assert(not brotliprefix.is_single_symbol(p))
+            test.assert_eq(brotliprefix.code_bits(p), 0)
+            test.assert(brotliprefix.lengths_of(p) == [1, 2, 2])
+        Err(e) => test.fail(e.message())
+
+    test.case("one symbol is legal at any length and answers without reading")
+    match brotliprefix.of_lengths([0, 0, 5, 0])
+        Ok(p)  =>
+            test.assert(brotliprefix.is_single_symbol(p))
+            test.assert_eq(brotliprefix.live_symbols(p), 1)
+            test.assert(brotliprefix.decode_symbol(p, bytes.zeros(1), 0) == [2, 0])
+        Err(e) => test.fail(e.message())
+
+    test.case("an empty code, a hole, an overflow and a length past 15 are refused")
+    match brotliprefix.of_lengths([0, 0, 0])
+        Ok(_)  => test.fail("no symbols")
+        Err(e) => test.assert(e.message() != "")
+    match brotliprefix.of_lengths([1, 2, 3])
+        Ok(_)  => test.fail("a hole")
+        Err(e) => test.assert(e.message() != "")
+    match brotliprefix.of_lengths([1, 1, 1])
+        Ok(_)  => test.fail("an overflow")
+        Err(e) => test.assert(e.message() != "")
+    match brotliprefix.of_lengths([16, 1, 1])
+        Ok(_)  => test.fail("a length of 16")
+        Err(e) => test.assert(e.message() != "")
+    test.assert_eq(brotliprefix.kraft_sum([16, 1]), 16384)
+
+@test
+fn test_symbols_are_decoded_most_significant_bit_of_the_code_first() [io]
+    match brotliprefix.of_lengths([1, 2, 3, 3])
+        Ok(p)  =>
+            // codes: 0, 10, 110, 111 — each packed first bit first.
+            test.assert(brotliprefix.decode_symbol(p, pack([[0, 1]]), 0) == [0, 1])
+            test.assert(brotliprefix.decode_symbol(p, pack([[1, 1], [0, 1]]), 0) == [1, 2])
+            test.assert(brotliprefix.decode_symbol(p, pack([[1, 1], [1, 1], [0, 1]]), 0) == [2, 3])
+            test.assert(brotliprefix.decode_symbol(p, pack([[1, 1], [1, 1], [1, 1]]), 0) == [3, 3])
+            test.assert(brotliprefix.decode_symbol(p, pack([[0, 2], [1, 1], [0, 1]]), 2) == [1, 2])
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_simple_codes_are_read_and_turned_into_lengths() [io]
+    test.case("one to four symbols, and the tie-break bit for four")
+    for n in 1..5
+        var fields = [[1, 2], [n - 1, 2]]
+        for k in 0..n
+            let sym = k + 10
+            fields = list.push(fields, [sym, 8])
+        if n == 4
+            fields = list.push(fields, [1, 1])
+        let src = pack(fields)
+        match brotliprefix.read_simple(src, 0, 256)
+            Ok(s)  =>
+                test.assert_eq(list.len(s.symbols), n)
+                test.assert(s.tree_select == (n == 4))
+                let p = brotliprefix.prefix_of_simple(s, 256)
+                test.assert_eq(brotliprefix.live_symbols(p), n)
+                test.assert_eq(brotliprefix.code_bits(p), 4 + 8 * n + (if n == 4 then 1 else 0))
+            Err(e) => test.fail(e.message())
+        match brotliprefix.read(src, 0, 256)
+            Ok(p)  =>
+                test.assert_eq(brotliprefix.live_symbols(p), n)
+                test.assert_eq(brotliprefix.code_bits(p), 4 + 8 * n + (if n == 4 then 1 else 0))
+                test.assert(brotliprefix.is_single_symbol(p) == (n == 1))
+            Err(e) => test.fail(e.message())
+
+    test.case("the lengths follow the order the symbols were written in")
+    let three = BroSimple { symbols: [5, 3, 4], tree_select: false }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(three, 8)) == [0, 0, 0, 2, 2, 1, 0, 0])
+    let two = BroSimple { symbols: [6, 1], tree_select: false }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(two, 8)) == [0, 1, 0, 0, 0, 0, 1, 0])
+    let four = BroSimple { symbols: [7, 2, 1, 0], tree_select: true }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(four, 8)) == [3, 3, 2, 0, 0, 0, 0, 1])
+    let flat = BroSimple { symbols: [7, 2, 1, 0], tree_select: false }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(flat, 8)) == [2, 2, 2, 0, 0, 0, 0, 2])
+    let out_of_alphabet = BroSimple { symbols: [9, 0], tree_select: false }
+    test.assert(brotliprefix.lengths_of(brotliprefix.prefix_of_simple(out_of_alphabet, 8)) == [1, 0, 0, 0, 0, 0, 0, 0])
+
+    test.case("a simple code that repeats or overruns the alphabet, or is cut short, is refused")
+    match brotliprefix.read_simple(pack([[1, 2], [1, 2], [3, 8], [3, 8]]), 0, 256)
+        Ok(_)  => test.fail("a repeated symbol")
+        Err(e) => test.assert_eq(e.message(), "brotli: the simple prefix code at byte 0 is invalid (2 symbols)")
+    match brotliprefix.read_simple(pack([[1, 2], [0, 2], [100, 7]]), 0, 100)
+        Ok(_)  => test.fail("a symbol past the alphabet")
+        Err(e) => test.assert(brotlierror.fault_at(e) == 0)
+    match brotliprefix.read_simple(pack([[1, 2], [3, 2], [3, 8]]), 0, 256)
+        Ok(_)  => test.fail("cut short")
+        Err(e) => test.assert_eq(e.message(), "brotli: the stream ends at byte 0 and 1 more bits were needed")
+    match brotliprefix.read_simple(pack([[0, 2], [0, 8]]), 0, 256)
+        Ok(_)  => test.fail("not a simple code")
+        Err(e) => test.assert(e.message() != "")
+    test.assert(brotliprefix.is_simple_at(pack([[1, 2]]), 0))
+    test.assert(brotliprefix.is_simple_at(pack([[0, 2], [1, 2]]), 2))
+    test.assert(not brotliprefix.is_simple_at(pack([[2, 2]]), 0))
+
+// A complex code over 16 symbols whose lengths are 3 3 3 3 0 0 0 2 2:
+// the code-length code gives symbol 2 one bit, symbol 3 two bits and the
+// repeat symbols 16 and 17 three bits each; the lengths are then "3", "16"
+// (three more of them), "17" (three zeros), "2", "2".
+fn complex_fields(hskip: Int) -> [[Int]]
+    var f = [[hskip, 2]]
+    // Lengths of the code-length code, in the order the format writes them
+    // (1 2 3 4 0 5 17 6 16), each spelled with its variable-length code.
+    var entries = [[0, 2], [7, 4], [3, 3], [0, 2], [0, 2], [0, 2], [2, 2], [0, 2], [2, 2]]
+    f = list.concat(f, list.drop(entries, hskip))
+    // Symbols: 3 = "10", 16 = "110" + 2 bits, 17 = "111" + 3 bits, 2 = "0".
+    // Each code is written first bit first, so "10" is the bit 1 and then 0.
+    f = list.push(f, [1, 1])
+    f = list.push(f, [0, 1])
+    f = list.push(f, [1, 1])
+    f = list.push(f, [1, 1])
+    f = list.push(f, [0, 1])
+    f = list.push(f, [0, 2])
+    f = list.push(f, [1, 1])
+    f = list.push(f, [1, 1])
+    f = list.push(f, [1, 1])
+    f = list.push(f, [0, 3])
+    f = list.push(f, [0, 1])
+    f = list.push(f, [0, 1])
+    f
+
+@test
+fn test_a_complex_code_is_read_with_its_repeat_symbols() [io]
+    let src = pack(complex_fields(0))
+    match brotliprefix.read_complex(src, 0, 16)
+        Ok(p)  =>
+            test.assert(brotliprefix.lengths_of(p) == [3, 3, 3, 3, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0])
+            test.assert_eq(brotliprefix.live_symbols(p), 6)
+            test.assert_eq(brotliprefix.code_bits(p), 38)
+            test.case("and the code it spells decodes: len 2 are 00 and 01, len 3 are 100 to 111")
+            test.assert(brotliprefix.decode_symbol(p, pack([[0, 1], [1, 1]]), 0) == [8, 2])
+            test.assert(brotliprefix.decode_symbol(p, pack([[1, 1], [1, 1], [0, 1]]), 0) == [2, 3])
+        Err(e) => test.fail(e.message())
+    match brotliprefix.read(src, 0, 16)
+        Ok(p)  => test.assert_eq(brotliprefix.code_bits(p), 38)
+        Err(e) => test.fail(e.message())
+    test.case("a code cut short is truncated")
+    match brotliprefix.read_complex(bytes.slice(src, 0, 3), 0, 16)
+        Ok(_)  => test.fail("cut short")
+        Err(e) => test.assert_eq(e.message(), "brotli: the stream ends at byte 3 and 1 more bits were needed")
+    test.case("a code-length code that is not complete is refused with its sum")
+    let zero = [0, 2]
+    let bad = [[0, 2],
+        [2, 2],
+        [2, 2],
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero]
+    match brotliprefix.read_complex(pack(bad), 0, 16)
+        Ok(_)  => test.fail("two symbols of length 3 leave a hole")
+        Err(e) => test.assert_eq(e.message(),
+            "brotli: the prefix code at byte 4 is not complete, its Kraft sum is 8192 of 32768")
+
+// ── Meta-block headers, block switching, commands ────────────────────
+
+@test
+fn test_a_meta_block_header_is_read_from_a_bit_position() [io]
+    test.case("the last empty block, 2 bits")
+    match brotliblock.parse_header(pack([[3, 2]]), 0)
+        Ok(h)  =>
+            test.assert(h.kind == BroLastEmpty)
+            test.assert(h.is_last)
+            test.assert_eq(h.header_bits, 2)
+            test.assert(not brotliblock.produces_output(h))
+            test.assert_eq(brotliblock.payload_at(h, 0), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("a stored block: its payload begins at the next byte boundary")
+    // not last, 4 nibbles, length 4097 (stored as 4096), stored flag
+    match brotliblock.parse_header(pack([[0, 3], [0, 1], [0, 2], [4096, 16], [1, 1]]), 3)
+        Ok(h)  =>
+            test.assert(h.kind == BroStored)
+            test.assert_eq(h.length, 4097)
+            test.assert(brotliblock.payload_is_aligned(h))
+            test.assert_eq(brotliblock.payload_at(h, 3), 24)
+            test.assert(brotliblock.produces_output(h))
+        Err(e) => test.fail(e.message())
+
+    test.case("a compressed block's payload follows its header directly")
+    match brotliblock.parse_header(pack([[0, 1], [0, 2], [5, 16], [0, 1]]), 0)
+        Ok(h)  =>
+            test.assert(h.kind == BroCompressed)
+            test.assert_eq(h.length, 6)
+            test.assert_eq(h.header_bits, 20)
+            test.assert_eq(brotliblock.payload_at(h, 0), 20)
+        Err(e) => test.fail(e.message())
+
+    test.case("metadata with a skip length of 9 bytes")
+    match brotliblock.parse_header(pack([[0, 1], [3, 2], [0, 1], [1, 2], [8, 8]]), 0)
+        Ok(h)  =>
+            test.assert(h.kind == BroMetadata)
+            test.assert_eq(h.skip_len, 9)
+            test.assert_eq(h.length, 0)
+            test.assert(not brotliblock.produces_output(h))
+        Err(e) => test.fail(e.message())
+
+    test.case("a header cut short")
+    match brotliblock.parse_header(pack([[0, 1], [1, 2]]), 0)
+        Ok(_)  => test.fail("cut short")
+        Err(e) => test.assert_eq(brotlierror.fault_at(e), 0)
+    match brotliblock.parse_header(pack([[0, 1], [3, 2], [0, 1], [2, 2], [1, 8]]), 0)
+        Ok(_)  => test.fail("cut short")
+        Err(e) => test.assert_eq(brotlierror.fault_at(e), 0)
+
+@test
+fn test_block_switching_follows_the_three_codes() [io]
+    let s = brotliblock.initial_block_state(5)
+    test.case("code 1 wraps from the last type to the first")
+    let at_two = BroBlockState { current: 2, previous: 0, remaining: 0 }
+    test.assert_eq(brotliblock.switch_to(at_two, 1, 3, 7).current, 0)
+    test.assert_eq(brotliblock.switch_to(at_two, 1, 4, 7).current, 3)
+    test.assert_eq(brotliblock.switch_to(at_two, 1, 3, 7).previous, 2)
+    test.assert_eq(brotliblock.switch_to(at_two, 1, 3, 7).remaining, 7)
+    test.assert_eq(brotliblock.switch_to(s, 3, 9, 1).current, 1)
+
+    test.case("the counts of the three categories")
+    test.assert_eq(brotliblock.block_type_count([5, 6, 7], BroLiterals), 5)
+    test.assert_eq(brotliblock.block_type_count([5, 6, 7], BroInsertCopy), 6)
+    test.assert_eq(brotliblock.block_type_count([5, 6, 7], BroDistances), 7)
+    test.assert_eq(brotliblock.block_type_count([5], BroDistances), 1)
+
+    test.case("the block-count alphabet")
+    test.assert_eq(brotliblock.block_count_symbols(), 26)
+    test.assert_eq(brotliblock.block_count_extra_bits(0), 2)
+    test.assert_eq(brotliblock.block_count_extra_bits(25), 24)
+    test.assert_eq(brotliblock.block_count_extra_bits(26), 0)
+    test.assert_eq(brotliblock.block_count_extra_bits(0 - 1), 0)
+    test.assert_eq(brotliblock.block_count_of(0, 3), 4)
+    test.assert_eq(brotliblock.block_count_of(25, 1), 16626)
+    test.assert_eq(brotliblock.block_count_of(26, 1), 0)
+    test.assert_eq(brotliblock.block_count_of(0 - 1, 1), 0)
+
+@test
+fn test_the_command_alphabet_is_eleven_cells_of_sixty_four() [io]
+    test.case("a cell pairs eight insert codes with eight copy codes")
+    let c0 = brotliblock.command_of(0, 0, 0)
+    test.assert_eq(c0.insert, 0)
+    test.assert_eq(c0.copy, 2)
+    let c63 = brotliblock.command_of(63, 0, 0)
+    test.assert_eq(c63.insert, 8)
+    test.assert_eq(c63.copy, 9)
+    let c703 = brotliblock.command_of(703, 5, 9)
+    test.assert_eq(c703.insert, 22594 + 5)
+    test.assert_eq(c703.copy, 2118 + 9)
+    test.assert(not c703.implicit_distance)
+
+    test.case("codes past the alphabet are held in the last cell, and below it in the first")
+    test.assert_eq(brotliblock.command_of(5000, 0, 0).insert, 194)
+    test.assert_eq(brotliblock.command_of(5000, 0, 0).copy, 70)
+    test.assert_eq(brotliblock.command_of(0 - 100, 0, 0).insert, 3)
+    test.assert_eq(brotliblock.command_of(0 - 100, 0, 0).copy, 6)
+
+    test.case("command_code puts a pair of codes in the cell that holds it")
+    test.assert_eq(brotliblock.command_code(0, 0, true), 0)
+    test.assert_eq(brotliblock.command_code(7, 15, true), 63 + 64)
+    test.assert_eq(brotliblock.command_code(8, 0, true), 0 - 1)
+    test.assert_eq(brotliblock.command_code(0, 16, true), 0 - 1)
+    test.assert_eq(brotliblock.command_code(0, 0, false), 128)
+    test.assert_eq(brotliblock.command_code(0, 8, false), 192)
+    test.assert_eq(brotliblock.command_code(8, 0, false), 256)
+    test.assert_eq(brotliblock.command_code(8, 8, false), 320)
+    test.assert_eq(brotliblock.command_code(0, 16, false), 384)
+    test.assert_eq(brotliblock.command_code(16, 0, false), 448)
+    test.assert_eq(brotliblock.command_code(8, 16, false), 512)
+    test.assert_eq(brotliblock.command_code(16, 8, false), 576)
+    test.assert_eq(brotliblock.command_code(16, 16, false), 640 + 0)
+    test.assert_eq(brotliblock.command_code(23, 23, false), 703)
+
+    test.case("every command code maps back to the pair that made it")
+    var wrong = 0
+    for ic in 0..24
+        for cc in 0..24
+            let code = brotliblock.command_code(ic, cc, false)
+            if brotliblock.insert_extra_bits(code) != brotliblock.insert_range(ic)[1]
+                wrong = wrong + 1
+            if brotliblock.copy_extra_bits(code) != brotliblock.copy_range(cc)[1]
+                wrong = wrong + 1
+            if brotliblock.command_of(code, 0, 0).insert != brotliblock.insert_range(ic)[0]
+                wrong = wrong + 1
+            if brotliblock.command_of(code, 0, 0).copy != brotliblock.copy_range(cc)[0]
+                wrong = wrong + 1
+    test.assert_eq(wrong, 0)
+    test.assert_eq(brotliblock.insert_code_for(0), 0)
+    test.assert_eq(brotliblock.insert_code_for(5000), 21)
+    test.assert_eq(brotliblock.copy_code_for(2), 0)
+    test.assert_eq(brotliblock.copy_code_for(3000), 23)
+
+// ── Distances ────────────────────────────────────────────────────────
+
+@test
+fn test_the_sixteen_cache_codes_name_the_remembered_distances_and_their_neighbours() [io]
+    let c = BroDistCache { d0: 100, d1: 200, d2: 300, d3: 400 }
+    let p = brotlidist.default_params()
+    let want = [100, 200, 300, 400, 99, 101, 98, 102, 97, 103, 199, 201, 198, 202, 197, 203]
+    for code in 0..16
+        test.assert_eq(brotlidist.distance_of(p, c, code, 0), want[code])
+
+    test.case("direct codes name the number after 15, postfix codes add extra bits and the low bits")
+    let q = BroDistParams { npostfix: 2, ndirect: 16 }
+    test.assert_eq(brotlidist.distance_of(q, c, 16, 0), 1)
+    test.assert_eq(brotlidist.distance_of(q, c, 31, 0), 16)
+    test.assert_eq(brotlidist.distance_of(q, c, 32, 0), 17)
+    test.assert_eq(brotlidist.distance_of(q, c, 33, 0), 18)
+    test.assert_eq(brotlidist.distance_of(q, c, 36, 0), 25)
+    test.assert_eq(brotlidist.distance_of(q, c, 40, 0), 33)
+    test.assert_eq(brotlidist.distance_of(q, c, 40, 3), 45)
+    test.assert_eq(brotlidist.extra_bits(q, 36), 1)
+    test.assert_eq(brotlidist.extra_bits(q, 40), 2)
+
+    test.case("the alphabet ends where the layout says")
+    test.assert(brotlidist.is_postfix_code(q, brotlidist.alphabet_size(q) - 1))
+    test.assert(not brotlidist.is_postfix_code(q, brotlidist.alphabet_size(q)))
+    test.assert(not brotlidist.is_cache_code(0 - 1))
+
+@test
+fn test_resolve_reads_a_dictionary_word_out_of_the_distance_past_the_output() [io]
+    let p = brotlidist.default_params()
+    let c = brotlidist.initial_cache()
+    test.case("the word is (distance - produced - 1) split by the length's index bits")
+    // code 40 with extra 0 is distance 16381; at 4 bytes produced, the
+    // word id is 16376, and the words of length 6 are indexed by 11 bits.
+    match brotlidist.resolve(p, c, 40, 0, 4, 6)
+        BroDictWord(len, index, transform) =>
+            test.assert_eq(len, 6)
+            test.assert_eq(index, 16376 & 2047)
+            test.assert_eq(transform, 16376 >> 11)
+        _                                  => test.fail("a dictionary word")
+    test.case("a distance of zero or less is the one corrupt case")
+    match brotlidist.resolve(p, BroDistCache { d0: 1, d1: 1, d2: 1, d3: 1 }, 6, 0, 100, 5)
+        BroDistOutOfRange(d, produced) =>
+            test.assert_eq(d, 0 - 1)
+            test.assert_eq(produced, 100)
+        _                              => test.fail("d0 - 2 is not a distance")
+    test.case("a transform past 120 is out of range")
+    match brotlidist.resolve(p, c, 48, 0, 4, 4)
+        BroDistOutOfRange(_, _) => test.assert(true)
+        _                       => test.fail("transform 255 does not exist")
+    test.assert_eq(brotlidist.max_backward(1008), 1008)
+
+// ── The errors ───────────────────────────────────────────────────────
+
+@test
+fn test_every_fault_says_where_and_in_words() [io]
+    let all = [BroWindowTooLarge(5, 3), BroBadWindowBits(1), BroTruncated(2, 3), BroBadPrefixCode(4, 5),
+               BroBadSimpleCode(6, 7), BroBadMetaBlock(8, "x"), BroBadBlockType(9, 1, 2), BroBadContextMap(10, 11),
+               BroBadDictWord(12, 13), BroBadTransform(14), BroBadDistance(15, 16), BroLengthMismatch(17, 18),
+               BroBadQuality(19), BroOutputFull(20)]
+    let at = [0 - 1, 0 - 1, 2, 4, 6, 8, 9, 10, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1]
+    let budget = [true, false, false, false, false, false, false, false, false, false, false, false, false, true]
+    for i in 0..list.len(all)
+        test.case("variant ${i}")
+        test.assert_eq(brotlierror.fault_at(all[i]), at[i])
+        test.assert_eq(brotlierror.is_budget(all[i]), budget[i])
+        test.assert(str.starts_with(brotlierror.describe(all[i]), "brotli: "))
+        test.assert_eq(all[i].message(), brotlierror.describe(all[i]))
+    test.assert_eq(brotlierror.describe(BroBadMetaBlock(8, "reserved bit")),
+        "brotli: the meta-block header at byte 8 has a bad reserved bit")
+    test.assert_eq(brotlierror.describe(BroBadBlockType(9, 1, 2)),
+        "brotli: the block switch at byte 9 names a type of category 1 past the 2 declared")
+    test.assert_eq(brotlierror.describe(BroBadContextMap(10, 11)),
+        "brotli: the context map at byte 10 is invalid (size 11)")
+    test.assert_eq(brotlierror.describe(BroBadDictWord(12, 13)),
+        "brotli: the dictionary has no word of length 12 at index 13")
+    test.assert_eq(brotlierror.describe(BroOutputFull(20)),
+        "brotli: the output buffer is full with 20 bytes waiting")
+
+@test
+fn test_the_small_remaining_answers() [io]
+    test.assert_eq(brotliprefix.repeat_extra_bits(5), 0)
+    test.assert_eq(brotliprefix.repeat_extra_bits(16), 2)
+    test.assert_eq(brotliprefix.repeat_extra_bits(17), 3)
+    test.assert(brotliprefix.repeat_symbols() == [16, 17])
+    test.assert_eq(brotliprefix.max_code_length(), 15)
+
+    test.case("a decoder asked to write into a buffer with no room says drain")
+    match brotlidec.decoder(brotlistream.empty_stream(), brotlistream.small_limits())
+        Err(e) => test.fail(e.message())
+        Ok(d0) =>
+            var d = d0
+            var none = bytes.zeros(0)
+            match brotlidec.step(var d, var none, 0)
+                BroWantsDrain => test.assert(true)
+                _             => test.fail("no room to write into")
+            test.assert(brotlidec.advanced(d).produced == 0)
+            var some = bytes.zeros(4)
+            match brotlidec.step(var d, var some, 0)
+                BroDone => test.assert(brotlidec.is_done(d))
+                _       => test.fail("the empty stream is done")
+
+@test
+fn test_the_reader_forms_leave_the_cursor_after_what_they_read() [io]
+    test.case("a header, then a prefix code, then a map, from one reader")
+    // last block, not empty; 4 nibbles; length 8; then a simple code of one
+    // symbol (97) over 256, then a context map: no RLE, a simple code over
+    // two symbols, entries 0 1 1 0, no MTF.
+    let src = pack([[1, 1],
+        [0, 1],
+        [0, 2],
+        [7, 16],
+        [1, 2],
+        [0, 2],
+        [97, 8],
+        [0, 1],
+        [1, 2],
+        [1, 2],
+        [0, 1],
+        [1, 1],
+        [0, 1],
+        [1, 1],
+        [1, 1],
+        [0, 1],
+        [0, 1]])
+    var r = brotlistream.reader(src, 0)
+    match brotliblock.read_header_from(var r)
+        Ok(h)  =>
+            test.assert(h.is_last)
+            test.assert_eq(h.length, 8)
+            test.assert_eq(r.pos, 20)
+        Err(e) => test.fail(e.message())
+    match brotliprefix.read_code(var r, 256)
+        Ok(p)  =>
+            test.assert(brotliprefix.is_single_symbol(p))
+            test.assert_eq(r.pos, 32)
+            let t = brotliprefix.table_of(p)
+            test.assert_eq(t.single, 97)
+            test.assert_eq(brotliprefix.decode_with(t, var r), 97)
+            test.assert_eq(r.pos, 32)
+        Err(e) => test.fail(e.message())
+    match brotlicontext.read_map_from(var r, 4, 2)
+        Ok(m)  =>
+            test.assert(m.tree_of == [0, 1, 1, 0])
+            test.assert_eq(r.pos, 44)
+        Err(e) => test.fail(e.message())
+
+    test.case("the table of a code orders symbols by length and then by value")
+    match brotliprefix.of_lengths([2, 1, 3, 3])
+        Ok(p)  =>
+            let t = brotliprefix.table_of(p)
+            test.assert(t.symbols == [1, 0, 2, 3])
+            test.assert(t.counts[1] == 1 and t.counts[2] == 1 and t.counts[3] == 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("transformed_from takes the data the caller holds")
+    let dict = brotlidict.dictionary_data()
+    test.assert_eq(hex_of(brotlidict.transformed_from(dict, 7, 3, 1)), CHECK_TRANSFORMED[0][1])
+    test.assert_eq(hex_of(brotlidict.transformed_from(dict, 7, 3, 200)),
+        "brotli: transform 200 is not in the table of 121")

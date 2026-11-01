@@ -12,8 +12,3 @@ APIDOC.md
 # package.  This package is a LIBRARY and builds none; the line is here
 # for when it grows a `main` and it does.
 /brotli-nv
-
-# The resolved dependency graph.  A library pins nothing for its
-# consumers — a consumer resolves its own — so the lock is a local
-# build artefact rather than a fact about the release.
-novo.lock
