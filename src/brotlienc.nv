@@ -1,21 +1,23 @@
 // brotlienc.nv — the encoder, declared honestly: quality 0 to 4, a
 // greedy matcher, and no claim to be the reference compressor.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE SCOPE IS NARROWER THAN THE DECODER'S AND IS NAMED RATHER THAN
 // DISCOVERED.  The reference implementation has eleven quality levels;
 // the top of that range is a block-splitting, context-clustering,
 // Zopfli-style search that takes seconds per megabyte and is a
 // research project of its own.  What this package declares is 0 to 4:
 //
-//   0 — literals and the cheapest matches, one pass, fixed codes;
-//   1 — a small hash chain, still one pass;
-//   2 to 4 — a longer hash chain, a lazy match at 3 and 4, and
-//        prefix codes built from the block's own histogram.
+//   0 — one candidate per position;
+//   1 — a hash chain of four;
+//   2 to 4 — chains of 16, 32 and 64, a lazy match at 3 and 4, and
+//        a search of the static dictionary.
+//
+// Every level writes prefix codes built from the meta-block's own
+// histogram, with one block type, one literal code and one distance
+// code, and keeps the stored form when it is smaller.
 //
 // All five are GREEDY: the matcher takes the best match it finds at
-// each position, with a one-position look-ahead above quality 2, and
+// each position, with a one-position look-ahead from quality 3, and
 // never searches for a globally better parse.  A stream from quality 4
 // here is a valid Brotli stream that any decoder reads; it is simply
 // larger than one the reference compressor at quality 11 would
@@ -24,10 +26,12 @@
 //
 // THE DICTIONARY IS USED, WHICH IS THE ONE PLACE THE ENCODER IS NOT
 // CHEAP.  A reference into the static dictionary is often the single
-// biggest win on a small HTML response — it is how the first hundred
-// bytes of a page cost almost nothing — so `BroQuality.use_dictionary`
+// biggest win on a small HTML response, so `BroQuality.use_dictionary`
 // is on by default, and a caller that wants the matcher's cost down
-// can turn it off and see the size grow.
+// can turn it off and see the size grow.  From quality 2 the matcher
+// looks for words of eight bytes or more that appear unchanged; a
+// shorter word is cheaper as literals, and the 121 transforms are not
+// searched.
 //
 // WHAT IS NOT DECLARED AT ALL: block splitting, context clustering,
 // custom dictionaries, and any quality above 4.  Each is a named
@@ -35,6 +39,11 @@
 // `quality: 11` and produced quality-4 output would be a lie the
 // compiler cannot catch.
 
+use std.bytes
+use std.int
+use brotliblock
+use brotlidict
+use brotlidist
 use brotlierror
 use brotlistream
 
@@ -66,9 +75,687 @@ struct BroQuality
     // meta-block.
     text_hint: Bool
 
+// ── Internals ────────────────────────────────────────────────────────
+
+// How much input is encoded as one meta-block, and how much of the end of
+// the input the matcher can still reach when the next one begins.
+const CHUNK = 131072
+const HIST = 131072
+
+// The size of one stored meta-block that `store` writes.
+const STORE_BLOCK = 65536
+
+// The encoder's states: nothing written, writing, finished.
+const ES_NEW = 0
+const ES_RUN = 1
+const ES_FINISHED = 2
+
+// The hash table of the matcher has 65536 slots.
+const HASH_SIZE = 65536
+
+// How many candidates the matcher looks at, by level.
+const DEPTHS: [Int] = [1, 4, 16, 32, 64]
+
+// A bit sink: whole bytes made so far, and the bits of the next one.
+struct Bw
+    var out: [Int]
+    var acc: Int
+    var n: Int
+
+// `nb` bits of `v`, least significant first.
+fn put(var w: Bw, v: Int, nb: Int)
+    if nb > 0
+        w.acc = w.acc | (v << w.n)
+        w.n = w.n + nb
+        while w.n >= 8
+            w.out = list.push(w.out, w.acc & 255)
+            w.acc = w.acc >>> 8
+            w.n = w.n - 8
+
+// Pad the partial byte with zero bits and write it.
+fn flush(var w: Bw)
+    if w.n > 0
+        w.out = list.push(w.out, w.acc & 255)
+        w.acc = 0
+        w.n = 0
+
+// How many bits the sink holds.
+fn bit_count(w: Bw) -> Int
+    list.len(w.out) * 8 + w.n
+
+// The window bits field of the stream header.
+fn write_window(var w: Bw, bits: Int)
+    if bits == 16
+        put(var w, 0, 1)
+    elif bits == 17
+        put(var w, 1, 7)
+    elif bits > 17
+        put(var w, 1 | ((bits - 17) << 1), 4)
+    else
+        put(var w, 1 | ((bits - 8) << 4), 7)
+
+// The head of a meta-block: the last flags, the length, and for a
+// block that is not the last, the stored flag.  The longest meta-block
+// this encoder writes is 131072 bytes, so the length takes four nibbles or
+// five.
+fn write_meta_head(var w: Bw, len: Int, last: Bool, stored: Bool)
+    put(var w, (if last then 1 else 0), 1)
+    if last
+        put(var w, 0, 1)
+    let m = len - 1
+    let nibbles = if m < 65536
+        4
+    else
+        5
+    put(var w, nibbles - 4, 2)
+    put(var w, m, nibbles * 4)
+    if not last
+        put(var w, (if stored then 1 else 0), 1)
+
+// A stored meta-block holding `k` bytes of `src` from `at`.
+fn write_stored(var w: Bw, src: Bytes, at: Int, k: Int)
+    write_meta_head(var w, k, false, true)
+    flush(var w)
+    for i in 0..k
+        w.out = list.push(w.out, bytes.byte_at(src, at + i) ?? 0)
+
+// The number of bits in `n`.
+fn bit_width(n: Int) -> Int
+    var width = 0
+    var m = n
+    while m > 0
+        width = width + 1
+        m = m >> 1
+    width
+
+// ── Prefix codes ─────────────────────────────────────────────────────
+
+// A prefix code ready to write symbols with: the length and the
+// bit-reversed code of each symbol, or the one symbol of a code that has
+// only one.
+struct Code
+    lens: [Int]
+    codes: [Int]
+    single: Int
+
+// The code lengths of a Huffman code over `hist`, no longer than
+// `limit` bits for the counts given.
+fn huff_try(hist: [Int], floor: Int) -> [Int]
+    var keys = [] as [Int]
+    for i in 0..list.len(hist)
+        if hist[i] > 0
+            keys = list.push(keys, (if hist[i] < floor then floor else hist[i]) * 1024 + i)
+    list.sort(keys)
+    let n = list.len(keys)
+    var weight = list.zeros(2 * n)
+    var parent = list.zeros(2 * n)
+    for i in 0..n
+        weight[i] = keys[i] >> 10
+    var i = 0
+    var j = n
+    var k = n
+    for _ in 0..n - 1
+        var pair = [0, 0]
+        for t in 0..2
+            if i < n and (j >= k or weight[i] <= weight[j])
+                pair[t] = i
+                i = i + 1
+            else
+                pair[t] = j
+                j = j + 1
+        weight[k] = weight[pair[0]] + weight[pair[1]]
+        parent[pair[0]] = k
+        parent[pair[1]] = k
+        k = k + 1
+    var depth = list.zeros(2 * n)
+    var idx = 2 * n - 3
+    while idx >= 0
+        depth[idx] = depth[parent[idx]] + 1
+        idx = idx - 1
+    var lens = list.zeros(list.len(hist))
+    for t in 0..n
+        lens[keys[t] & 1023] = depth[t]
+    lens
+
+// Code lengths limited to `maxlen`, by raising the smallest counts until
+// the tree is shallow enough.
+fn huff_lengths(hist: [Int], maxlen: Int) -> [Int]
+    var floor = 1
+    var lens = huff_try(hist, floor)
+    while longest(lens) > maxlen
+        floor = floor * 2
+        lens = huff_try(hist, floor)
+    lens
+
+// The largest entry of a list.
+fn longest(xs: [Int]) -> Int
+    var most = 0
+    for x in xs
+        if x > most
+            most = x
+    most
+
+// `v` with its low `n` bits in the opposite order.
+fn reverse_bits(v: Int, n: Int) -> Int
+    var out = 0
+    var x = v
+    for _ in 0..n
+        out = (out << 1) | (x & 1)
+        x = x >> 1
+    out
+
+// The canonical code of each symbol, bit-reversed for writing.
+fn canonical(lens: [Int]) -> [Int]
+    var count = list.zeros(16)
+    for l in lens
+        if l > 0
+            count[l] = count[l] + 1
+    var next = list.zeros(16)
+    var code = 0
+    for l in 1..16
+        code = (code + count[l - 1]) << 1
+        if l == 1
+            code = 0
+        next[l] = code
+    var codes = list.zeros(list.len(lens))
+    for i in 0..list.len(lens)
+        let l = lens[i]
+        if l > 0
+            codes[i] = reverse_bits(next[l], l)
+            next[l] = next[l] + 1
+    codes
+
+// The code for a histogram: Huffman lengths, or a single symbol when at
+// most one symbol was used.
+fn make_code(hist: [Int], maxlen: Int) -> Code
+    var used = 0
+    var first = 0
+    for i in 0..list.len(hist)
+        if hist[i] > 0
+            if used == 0
+                first = i
+            used = used + 1
+    if used <= 1
+        Code { lens: list.zeros(list.len(hist)), codes: list.zeros(list.len(hist)), single: first }
+    else
+        let lens = huff_lengths(hist, maxlen)
+        Code { lens: lens, codes: canonical(lens), single: 0 - 1 }
+
+// Write a symbol with a code.
+fn put_symbol(var w: Bw, c: Code, sym: Int)
+    put(var w, c.codes[sym], c.lens[sym])
+
+// Write a code in the stream: a simple code for up to four symbols,
+// otherwise a complex one.
+fn write_code(var w: Bw, c: Code, alphabet: Int)
+    let width = bit_width(alphabet - 1)
+    if c.single >= 0
+        put(var w, 1, 2)
+        put(var w, 0, 2)
+        put(var w, c.single, width)
+    else
+        var keys = [] as [Int]
+        for i in 0..list.len(c.lens)
+            if c.lens[i] > 0
+                keys = list.push(keys, c.lens[i] * 1024 + i)
+        list.sort(keys)
+        if list.len(keys) <= 4
+            put(var w, 1, 2)
+            put(var w, list.len(keys) - 1, 2)
+            for k in keys
+                put(var w, k & 1023, width)
+            if list.len(keys) == 4
+                put(var w, (if (keys[0] >> 10) == 1 then 1 else 0), 1)
+        else
+            write_complex(var w, c.lens)
+
+// The code-length code's way of writing a length of 0 to 5: the bits to
+// put and how many.
+const CL_BITS: [Int] = [0, 7, 3, 2, 1, 15]
+const CL_WIDTH: [Int] = [2, 4, 3, 2, 2, 4]
+
+// A complex code: the lengths of the code-length code, then the lengths
+// of the symbols with runs of zeros written as symbol 17.
+fn write_complex(var w: Bw, lens: [Int])
+    var last = list.len(lens) - 1
+    while last > 0 and lens[last] == 0
+        last = last - 1
+    var syms = [] as [Int]
+    var extras = [] as [Int]
+    var skip_to = 0
+    var after_run = false
+    for i in 0..last + 1
+        if i >= skip_to
+            if lens[i] != 0
+                syms = list.push(syms, lens[i])
+                extras = list.push(extras, 0)
+                after_run = false
+            else
+                var run = 0
+                while i + run <= last and lens[i + run] == 0
+                    run = run + 1
+                if run >= 3 and not after_run
+                    let r = if run > 10
+                        10
+                    else
+                        run
+                    syms = list.push(syms, 17)
+                    extras = list.push(extras, r - 3)
+                    after_run = true
+                    skip_to = i + r
+                else
+                    syms = list.push(syms, 0)
+                    extras = list.push(extras, 0)
+                    after_run = false
+    var hist = list.zeros(18)
+    for sy in syms
+        hist[sy] = hist[sy] + 1
+    let cl = make_code(hist, 5)
+    var cl_lens = cl.lens[:]
+    if cl.single >= 0
+        cl_lens[cl.single] = 1
+    var skip = 0
+    if cl_lens[1] == 0 and cl_lens[2] == 0
+        skip = if cl_lens[3] == 0
+            3
+        else
+            2
+    put(var w, skip, 2)
+    let order = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    var space = 32
+    var k = skip
+    while k < 18 and space > 0
+        let l = cl_lens[order[k]]
+        put(var w, CL_BITS[l], CL_WIDTH[l])
+        if l != 0
+            space = space - (32 >> l)
+        k = k + 1
+    for t in 0..list.len(syms)
+        put_symbol(var w, cl, syms[t])
+        if syms[t] == 17
+            put(var w, extras[t], 3)
+
+// ── Finding matches ──────────────────────────────────────────────────
+
+// Where a four-byte sequence goes in the hash table.
+fn hash4(buf: Bytes, i: Int) -> Int
+    let v = bytes.u32_le_at(buf, i) ?? 0
+    (int.wrapping_mul(v, 2654435761) >>> 16) & 65535
+
+// Put position `i` in the table.  Positions are stored one higher than they
+// are, so that the zeros a fresh table holds mean no position.
+fn insert_pos(var head: [Int], var prev: [Int], buf: Bytes, i: Int)
+    if i + 4 <= bytes.len(buf)
+        let h = hash4(buf, i)
+        prev[i] = head[h]
+        head[h] = i + 1
+
+// How many bytes at `a` of `x` and at `b` of `y` agree, up to `limit`.
+fn match_len(x: Bytes, a: Int, y: Bytes, b: Int, limit: Int) -> Int
+    var k = 0
+    while k + 8 <= limit and (bytes.u64_le_at(x, a + k) ?? 0) == (bytes.u64_le_at(y, b + k) ?? 1)
+        k = k + 8
+    while k < limit and (bytes.byte_at(x, a + k) ?? 0) == (bytes.byte_at(y, b + k) ?? 1)
+        k = k + 1
+    k
+
+// The dictionary's words as the matcher sees them: a hash table over the
+// first four bytes of each word of 8 to 24 bytes, and for each word its
+// length, where it starts in the data and its index among the words of
+// its length.
+struct DictIndex
+    data: Bytes
+    head: [Int]
+    next: [Int]
+    wlen: [Int]
+    woff: [Int]
+    wid: [Int]
+
+// Index the words of 8 to 24 bytes.
+fn build_dict_index(var e: BroEncoder)
+    e.dict = brotlidict.dictionary_data()
+    e.dhead = list.zeros(HASH_SIZE)
+    for l in 8..25
+        let base = brotlidict.offset_of_length(l)
+        for i in 0..brotlidict.words_of_length(l)
+            let off = base + i * l
+            let h = hash4(e.dict, off)
+            e.dnext = list.push(e.dnext, e.dhead[h])
+            e.dhead[h] = list.len(e.dnext)
+            e.dlen = list.push(e.dlen, l)
+            e.doff = list.push(e.doff, off)
+            e.did = list.push(e.did, i)
+
+// The longest dictionary word that starts at `pos`, as a slot of the
+// index, or -1.  Only words of at least 8 bytes are looked for: a
+// reference into the dictionary costs the distance code, about thirty
+// bits, and a shorter word is cheaper as literals.
+fn find_word(dx: DictIndex, buf: Bytes, pos: Int) -> Int
+    let n = bytes.len(buf)
+    var best = 0 - 1
+    var best_len = 7
+    if pos + 8 <= n
+        var cand = dx.head[hash4(buf, pos)] - 1
+        var tries = 0
+        while cand >= 0 and tries < 32
+            let l = dx.wlen[cand]
+            if l > best_len and pos + l <= n and match_len(dx.data, dx.woff[cand], buf, pos, l) >= l
+                best = cand
+                best_len = l
+            cand = dx.next[cand] - 1
+            tries = tries + 1
+    best
+
+// The longest match for position `pos`, as length * 2^25 + distance, or 0
+// when there is none of at least four bytes.
+fn find_match(head: [Int], prev: [Int], buf: Bytes, pos: Int, depth: Int, maxd: Int) -> Int
+    let n = bytes.len(buf)
+    if pos + 4 > n
+        0
+    else
+        var best_len = 3
+        var best_d = 0
+        var cand = head[hash4(buf, pos)] - 1
+        var tries = 0
+        while cand >= 0 and tries < depth and pos - cand <= maxd
+            let l = match_len(buf, cand, buf, pos, n - pos)
+            if l > best_len
+                best_len = l
+                best_d = pos - cand
+            cand = prev[cand] - 1
+            tries = tries + 1
+        if best_d == 0
+            0
+        else
+            best_len * 33554432 + best_d
+
+// What the matcher decided: for each command, the literals before it, the
+// bytes it copies (0 for the last) and the distance; and every literal.
+struct Plan
+    var ins: [Int]
+    var cpy: [Int]
+    var dst: [Int]
+    var dict: [Int]
+    var lits: [Int]
+
+// Cut the bytes of `buf` from `start` into commands.
+fn parse(buf: Bytes, start: Int, level: Int, maxd: Int, base: Int, dx: DictIndex) -> Plan
+    let n = bytes.len(buf)
+    var head = list.zeros(HASH_SIZE)
+    var prev = list.zeros(n)
+    for i in 0..start
+        insert_pos(var head, var prev, buf, i)
+    var plan = Plan { ins: [] as [Int], cpy: [] as [Int], dst: [] as [Int], dict: [] as [Int],
+                      lits: [] as [Int] }
+    let depth = DEPTHS[level]
+    var pos = start
+    var lit_start = start
+    while pos < n
+        var found = find_match(head, prev, buf, pos, depth, maxd)
+        if found != 0 and level >= 3 and pos + 1 < n
+            insert_pos(var head, var prev, buf, pos)
+            let next = find_match(head, prev, buf, pos + 1, depth, maxd)
+            if next / 33554432 > found / 33554432 + 1
+                found = 0
+        else
+            insert_pos(var head, var prev, buf, pos)
+        let word = if level >= 2 and bytes.len(dx.data) > 0
+            find_word(dx, buf, pos)
+        else
+            0 - 1
+        let by_word = word >= 0 and (found == 0 or dx.wlen[word] > found / 33554432 + 4)
+        if found == 0 and not by_word
+            pos = pos + 1
+        else
+            let len = if by_word
+                dx.wlen[word]
+            else
+                found / 33554432
+            plan.ins = list.push(plan.ins, pos - lit_start)
+            plan.cpy = list.push(plan.cpy, len)
+            if by_word
+                let reach = if pos + base < maxd
+                    pos + base
+                else
+                    maxd
+                plan.dst = list.push(plan.dst, reach + 1 + dx.wid[word])
+                plan.dict = list.push(plan.dict, 1)
+            else
+                plan.dst = list.push(plan.dst, found & 33554431)
+                plan.dict = list.push(plan.dict, 0)
+            for k in lit_start..pos
+                plan.lits = list.push(plan.lits, bytes.byte_at(buf, k) ?? 0)
+            if level >= 2
+                for k in pos + 1..pos + len
+                    insert_pos(var head, var prev, buf, k)
+            pos = pos + len
+            lit_start = pos
+    if lit_start < n
+        plan.ins = list.push(plan.ins, n - lit_start)
+        plan.cpy = list.push(plan.cpy, 0)
+        plan.dst = list.push(plan.dst, 0)
+        plan.dict = list.push(plan.dict, 0)
+        for k in lit_start..n
+            plan.lits = list.push(plan.lits, bytes.byte_at(buf, k) ?? 0)
+    plan
+
+// ── Writing a meta-block ─────────────────────────────────────────────
+
+// The commands of a plan as symbols and extra bits, ready to be counted
+// and written.
+struct Script
+    var cmd: [Int]
+    var ie: [Int]
+    var ieb: [Int]
+    var ce: [Int]
+    var ceb: [Int]
+    var dsym: [Int]
+    var de: [Int]
+    var deb: [Int]
+
+// Turn a plan into symbols, tracking the distance cache the way the
+// decoder will.
+fn script_of(plan: Plan) -> Script
+    var sc = Script { cmd: [] as [Int], ie: [] as [Int], ieb: [] as [Int], ce: [] as [Int],
+                      ceb: [] as [Int], dsym: [] as [Int], de: [] as [Int], deb: [] as [Int] }
+    var cache = BroDistCache { d0: 4, d1: 11, d2: 15, d3: 16 }
+    for i in 0..list.len(plan.ins)
+        let ic = brotliblock.insert_code_for(plan.ins[i])
+        let ir = brotliblock.insert_range(ic)
+        sc.ie = list.push(sc.ie, plan.ins[i] - ir[0])
+        sc.ieb = list.push(sc.ieb, ir[1])
+        if plan.cpy[i] == 0
+            sc.cmd = list.push(sc.cmd, brotliblock.command_code(ic, 0, false))
+            sc.ce = list.push(sc.ce, 0)
+            sc.ceb = list.push(sc.ceb, 0)
+            sc.dsym = list.push(sc.dsym, 0 - 1)
+            sc.de = list.push(sc.de, 0)
+            sc.deb = list.push(sc.deb, 0)
+        else
+            let cc = brotliblock.copy_code_for(plan.cpy[i])
+            let cr = brotliblock.copy_range(cc)
+            sc.ce = list.push(sc.ce, plan.cpy[i] - cr[0])
+            sc.ceb = list.push(sc.ceb, cr[1])
+            let d = plan.dst[i]
+            let by_word = plan.dict[i] == 1
+            let k = if by_word
+                0 - 1
+            else
+                cache_slot(cache, d)
+            let implicit = k == 0 and brotliblock.command_code(ic, cc, true) >= 0
+            if implicit
+                sc.cmd = list.push(sc.cmd, brotliblock.command_code(ic, cc, true))
+                sc.dsym = list.push(sc.dsym, 0 - 1)
+                sc.de = list.push(sc.de, 0)
+                sc.deb = list.push(sc.deb, 0)
+            else
+                sc.cmd = list.push(sc.cmd, brotliblock.command_code(ic, cc, false))
+                if k >= 0
+                    sc.dsym = list.push(sc.dsym, k)
+                    sc.de = list.push(sc.de, 0)
+                    sc.deb = list.push(sc.deb, 0)
+                    cache = brotlidist.push(cache, k, d)
+                else
+                    let x = d + 3
+                    let nb = bit_width(x) - 2
+                    sc.dsym = list.push(sc.dsym, 16 + 2 * (nb - 1) + ((x >> nb) & 1))
+                    sc.de = list.push(sc.de, x & ((1 << nb) - 1))
+                    sc.deb = list.push(sc.deb, nb)
+                    if not by_word
+                        cache = brotlidist.push(cache, 16, d)
+    sc
+
+// Which of the four remembered distances `d` is, or -1.
+fn cache_slot(c: BroDistCache, d: Int) -> Int
+    if d == c.d0
+        0
+    elif d == c.d1
+        1
+    elif d == c.d2
+        2
+    elif d == c.d3
+        3
+    else
+        0 - 1
+
+// A compressed meta-block of `len` bytes, with one block type for each
+// category, one literal tree and one distance tree.
+fn write_compressed(var w: Bw, len: Int, last: Bool, plan: Plan, text_hint: Bool)
+    let sc = script_of(plan)
+    var lit_hist = list.zeros(256)
+    for b in plan.lits
+        lit_hist[b] = lit_hist[b] + 1
+    var cmd_hist = list.zeros(704)
+    for c in sc.cmd
+        cmd_hist[c] = cmd_hist[c] + 1
+    var dist_hist = list.zeros(64)
+    for d in sc.dsym
+        if d >= 0
+            dist_hist[d] = dist_hist[d] + 1
+    let lit = make_code(lit_hist, 15)
+    let cmd = make_code(cmd_hist, 15)
+    let dist = make_code(dist_hist, 15)
+    write_meta_head(var w, len, last, false)
+    put(var w, 0, 3)
+    put(var w, 0, 6)
+    put(var w, (if text_hint then 2 else 0), 2)
+    put(var w, 0, 2)
+    write_code(var w, lit, 256)
+    write_code(var w, cmd, 704)
+    write_code(var w, dist, 64)
+    var at = 0
+    for i in 0..list.len(sc.cmd)
+        put_symbol(var w, cmd, sc.cmd[i])
+        put(var w, sc.ie[i], sc.ieb[i])
+        put(var w, sc.ce[i], sc.ceb[i])
+        for _ in 0..plan.ins[i]
+            put_symbol(var w, lit, plan.lits[at])
+            at = at + 1
+        if sc.dsym[i] >= 0
+            put_symbol(var w, dist, sc.dsym[i])
+            put(var w, sc.de[i], sc.deb[i])
+
+// A fresh encoder.
+fn blank_encoder(q: BroQuality) -> BroEncoder
+    BroEncoder { window: bytes.zeros(0), window_len: 0, consumed: 0, emitted: 0,
+                 quality_level: q.level, quality_window_bits: q.window_bits,
+                 quality_use_dictionary: q.use_dictionary, quality_text_hint: q.text_hint,
+                 state: ES_NEW, pend: bytes.zeros(0), ready: bytes.zeros(0), acc: 0, nacc: 0,
+                 dict: bytes.zeros(0), dhead: [] as [Int], dnext: [] as [Int], dlen: [] as [Int],
+                 doff: [] as [Int], did: [] as [Int] }
+
+// The sink an encoder continues writing into.
+fn sink_of(e: BroEncoder) -> Bw
+    var w = Bw { out: [] as [Int], acc: e.acc, n: e.nacc }
+    if e.state == ES_NEW
+        write_window(var w, e.quality_window_bits)
+    w
+
+// Take what a sink holds back into the encoder.
+fn commit(var e: BroEncoder, w: Bw)
+    e.ready = e.ready + bytes.from_byte_list(w.out)
+    e.acc = w.acc
+    e.nacc = w.n
+    e.state = ES_RUN
+
+// Encode one chunk of input as a meta-block: compressed if that is
+// smaller, stored otherwise.
+fn encode_chunk(var e: BroEncoder, chunk: Bytes, last: Bool)
+    let buf = e.window + chunk
+    let start = bytes.len(e.window)
+    if e.quality_use_dictionary and e.quality_level >= 2 and list.len(e.dlen) == 0
+        build_dict_index(var e)
+    let dx = DictIndex { data: e.dict, head: e.dhead, next: e.dnext, wlen: e.dlen, woff: e.doff, wid: e.did }
+    let plan = parse(buf, start, e.quality_level, brotlistream.window_size_of(e.quality_window_bits),
+                     e.consumed - start, dx)
+    var cw = sink_of(e)
+    write_compressed(var cw, bytes.len(chunk), last, plan, e.quality_text_hint)
+    var sw = sink_of(e)
+    write_stored(var sw, chunk, 0, bytes.len(chunk))
+    if last
+        put(var sw, 3, 2)
+    if bit_count(cw) <= bit_count(sw)
+        commit(var e, cw)
+    else
+        commit(var e, sw)
+    let total = bytes.len(buf)
+    let keep = if total > HIST
+        HIST
+    else
+        total
+    e.window = bytes.slice(buf, total - keep, total)
+    e.window_len = keep
+    e.consumed = e.consumed + bytes.len(chunk)
+
+// End the stream: the last meta-block, the partial byte.
+fn finish_stream(var e: BroEncoder)
+    let rest = e.pend
+    e.pend = bytes.zeros(0)
+    if bytes.len(rest) == 0
+        var w = sink_of(e)
+        put(var w, 3, 2)
+        commit(var e, w)
+    else
+        encode_chunk(var e, rest, true)
+    var w = Bw { out: [] as [Int], acc: e.acc, n: e.nacc }
+    flush(var w)
+    commit(var e, w)
+    e.acc = 0
+    e.nacc = 0
+    e.state = ES_FINISHED
+
+// Accept input, encode the whole chunks of it, and hand over what fits.
+fn write_into(var e: BroEncoder, input: Bytes, var out: Bytes, at: Int) -> Int
+    e.pend = e.pend + input
+    while bytes.len(e.pend) >= CHUNK
+        let chunk = bytes.slice(e.pend, 0, CHUNK)
+        e.pend = bytes.slice(e.pend, CHUNK, bytes.len(e.pend))
+        encode_chunk(var e, chunk, false)
+    hand_over(var e, var out, at)
+
+// End the stream if it is not ended, and hand over what fits.
+fn finish_into(var e: BroEncoder, var out: Bytes, at: Int) -> Int
+    if e.state != ES_FINISHED
+        finish_stream(var e)
+    hand_over(var e, var out, at)
+
+// Hand over as much finished output as the caller's buffer holds.
+fn hand_over(var e: BroEncoder, var out: Bytes, at: Int) -> Int
+    let room = bytes.len(out) - at
+    let have = bytes.len(e.ready)
+    let n = if have < room
+        have
+    else
+        room
+    if n > 0
+        bytes.copy_into(out, at, e.ready, 0, n)
+        e.ready = bytes.slice(e.ready, n, have)
+        e.emitted = e.emitted + n
+    n
+
 // The fastest setting: level 0, a 4 MiB window, dictionary on.
 pub fn fastest() -> BroQuality []
-    todo("brotli-nv.brotlienc.fastest")
+    BroQuality { level: 0, window_bits: 22, use_dictionary: true, text_hint: false }
 
 // The best this package declares: level 4, a 4 MiB window, dictionary
 // on.
@@ -76,40 +763,42 @@ pub fn fastest() -> BroQuality []
 // NOT the best Brotli can do, and the name says so — `best` would be
 // a claim about the format rather than about this encoder.
 pub fn best_declared() -> BroQuality []
-    todo("brotli-nv.brotlienc.best_declared")
+    BroQuality { level: 4, window_bits: 22, use_dictionary: true, text_hint: false }
 
 // The levels this package implements, as a pair: 0 and 4.
 //
 // Published so a caller mapping from another library's 0-to-11 scale
 // can clamp explicitly, and so `BroBadQuality` has a range to name.
 pub fn quality_range() -> [Int] []
-    todo("brotli-nv.brotlienc.quality_range")
+    [0, 4]
 
 // Whether a level is one this package implements.
 pub fn supports_quality(level: Int) -> Bool []
-    todo("brotli-nv.brotlienc.supports_quality")
+    level >= 0 and level <= 4
 
 // ── Encoding ─────────────────────────────────────────────────────────
 
 // An encode in progress.
+//
+// The encoder writes finished bytes into `ready`, and `write` and
+// `finish` hand them over as the caller's buffer allows, so its memory
+// is a function of its WINDOW and one chunk of input.
 pub struct BroEncoder
-    // The window of input the matcher can reach back into.
-    window: Bytes
+    // The tail of the input already encoded, which the matcher can reach
+    // back into.
+    var window: Bytes
     // How many bytes of it are live.
-    window_len: Int
-    // How many bytes of input have been consumed.
-    consumed: Int
-    // How many bytes of output have been produced.
-    emitted: Int
+    var window_len: Int
+    // How many bytes of input have been encoded into meta-blocks.
+    var consumed: Int
+    // How many bytes of output have been handed over.
+    var emitted: Int
     // The settings, FLATTENED rather than held as a `BroQuality`.
     //
-    // SPEC § 14.5 keeps an unboxed struct out of a boxed struct's
-    // field, and `BroQuality` is `@value` because it is a parameter to
-    // five calls and is built once per stream.  So the owner carries
-    // the four numbers and `quality_of` rebuilds the value — which is
-    // the shape `docs/publishing.md` describes for a settings value
-    // that is both passed and stored, and which the README names as a
-    // place the language decided the layout.
+    // SPEC § 14.5 keeps an unboxed struct out of a boxed struct's field,
+    // and `BroQuality` is `@value` because it is a parameter to five
+    // calls and is built once per stream.  So the owner carries the four
+    // numbers and `quality_of` rebuilds the value.
     quality_level: Int
     // `WBITS` for the stream being produced.
     quality_window_bits: Int
@@ -117,16 +806,36 @@ pub struct BroEncoder
     quality_use_dictionary: Bool
     // Whether the input was declared to be text.
     quality_text_hint: Bool
-    // The internal state, as an `Int` for the same reason the
-    // decoder's is.
-    state: Int
+    // The internal state, as an `Int` for the same reason the decoder's
+    // is.
+    var state: Int
+    // Input accepted and not yet encoded.
+    var pend: Bytes
+    // Output made and not yet handed over.
+    var ready: Bytes
+    // The bits of the last byte that is not complete yet, and how many.
+    var acc: Int
+    var nacc: Int
+    // The index of the static dictionary's words of 8 to 24 bytes, built
+    // when the first chunk is encoded and only if the dictionary is used.
+    var dict: Bytes
+    var dhead: [Int]
+    var dnext: [Int]
+    var dlen: [Int]
+    var doff: [Int]
+    var did: [Int]
 
 // Start an encode.
 //
 // `BroBadQuality` when the level is outside `quality_range`;
 // `BroBadWindowBits` when the window bits are outside 10 to 24.
 pub fn encoder(q: BroQuality) -> Result<BroEncoder, brotlierror.BroFault> []
-    todo("brotli-nv.brotlienc.encoder")
+    if not supports_quality(q.level)
+        Err(BroBadQuality(q.level))
+    elif q.window_bits < 10 or q.window_bits > 24
+        Err(BroBadWindowBits(q.window_bits))
+    else
+        Ok(blank_encoder(q))
 
 // Feed input, writing whatever compressed bytes are ready into the
 // caller's buffer.
@@ -135,9 +844,12 @@ pub fn encoder(q: BroQuality) -> Result<BroEncoder, brotlierror.BroFault> []
 // same reason: the encoder's memory is a function of its WINDOW and
 // not of how much the caller has pushed through it.  Answers how many
 // bytes were written.
-pub fn write(e: BroEncoder, input: Bytes, out: Bytes,
+pub fn write(var e: BroEncoder, input: Bytes, var out: Bytes,
              at: Int) -> Result<Int, brotlierror.BroFault> []
-    todo("brotli-nv.brotlienc.write")
+    if e.state == ES_FINISHED
+        Err(BroOutputFull(0))
+    else
+        Ok(write_into(var e, input, var out, at))
 
 // The settings an encoder was built with.
 //
@@ -146,11 +858,12 @@ pub fn write(e: BroEncoder, input: Bytes, out: Bytes,
 // reuse its settings does not have to read four fields and hope it got
 // them in the right order.
 pub fn quality_of(e: BroEncoder) -> BroQuality []
-    todo("brotli-nv.brotlienc.quality_of")
+    BroQuality { level: e.quality_level, window_bits: e.quality_window_bits,
+                 use_dictionary: e.quality_use_dictionary, text_hint: e.quality_text_hint }
 
 // The encoder after a `write`.
 pub fn advanced(e: BroEncoder) -> BroEncoder []
-    todo("brotli-nv.brotlienc.advanced")
+    e
 
 // Close the stream: emit the last meta-block and the end marker.
 //
@@ -159,18 +872,25 @@ pub fn advanced(e: BroEncoder) -> BroEncoder []
 // and without it the decoder waits for a meta-block that never comes.
 // Its own call so the mistake is a missing line rather than a subtle
 // flag.
-pub fn finish(e: BroEncoder, out: Bytes, at: Int) -> Result<Int, brotlierror.BroFault> []
-    todo("brotli-nv.brotlienc.finish")
+pub fn finish(var e: BroEncoder, var out: Bytes, at: Int) -> Result<Int, brotlierror.BroFault> []
+    Ok(finish_into(var e, var out, at))
 
 // How many bytes the encoder has written.
 pub fn emitted(e: BroEncoder) -> Int []
-    todo("brotli-nv.brotlienc.emitted")
+    e.emitted
 
 // ── For a caller that has the whole thing ────────────────────────────
 
 // Compress a buffer the caller already holds.
 pub fn compress(src: Bytes, q: BroQuality) -> Result<Bytes, brotlierror.BroFault> []
-    todo("brotli-nv.brotlienc.compress")
+    match encoder(q)
+        Err(err) => Err(err)
+        Ok(e0)   =>
+            var e = e0
+            var out = bytes.zeros(max_compressed_size(bytes.len(src)))
+            let a = write_into(var e, src, var out, 0)
+            let b = finish_into(var e, var out, a)
+            Ok(bytes.slice(out, 0, a + b))
 
 // The largest output `compress` can produce for an input of this size.
 //
@@ -179,7 +899,7 @@ pub fn compress(src: Bytes, q: BroQuality) -> Result<Bytes, brotlierror.BroFault
 // sizing a buffer from the input length under-allocates.  The bound is
 // published rather than left to be discovered by a truncated stream.
 pub fn max_compressed_size(input_len: Int) -> Int []
-    todo("brotli-nv.brotlienc.max_compressed_size")
+    input_len + (input_len >> 12) + 64
 
 // A stream that stores its input verbatim.
 //
@@ -189,7 +909,23 @@ pub fn max_compressed_size(input_len: Int) -> Int []
 // incompressible data, and it is what a test round-trips against
 // before any matcher exists.
 pub fn store(src: Bytes, window_bits: Int) -> Result<Bytes, brotlierror.BroFault> []
-    todo("brotli-nv.brotlienc.store")
+    if window_bits < 10 or window_bits > 24
+        Err(BroBadWindowBits(window_bits))
+    else
+        var w = Bw { out: [] as [Int], acc: 0, n: 0 }
+        write_window(var w, window_bits)
+        var at = 0
+        let n = bytes.len(src)
+        while at < n
+            let k = if n - at > STORE_BLOCK
+                STORE_BLOCK
+            else
+                n - at
+            write_stored(var w, src, at, k)
+            at = at + k
+        put(var w, 3, 2)
+        flush(var w)
+        Ok(bytes.from_byte_list(w.out))
 
 // ── What this encoder is not ─────────────────────────────────────────
 
@@ -200,7 +936,7 @@ pub fn store(src: Bytes, window_bits: Int) -> Result<Bytes, brotlierror.BroFault
 // are block splitting and context clustering, which are named absences
 // in the README and a row of their own.
 pub fn format_max_quality() -> Int []
-    todo("brotli-nv.brotlienc.format_max_quality")
+    11
 
 // Whether the encoder splits a meta-block by content: false.
 //
@@ -210,7 +946,7 @@ pub fn format_max_quality() -> Int []
 // a sentence, because a caller comparing output sizes against another
 // library deserves to be able to assert which feature is missing.
 pub fn splits_blocks() -> Bool []
-    todo("brotli-nv.brotlienc.splits_blocks")
+    false
 
 // Whether the encoder can be given a custom dictionary: false.
 //
@@ -219,7 +955,7 @@ pub fn splits_blocks() -> Bool []
 // own bytes prepended to the window rather than indexed by length —
 // and they are a row of their own rather than half-built here.
 pub fn supports_custom_dictionary() -> Bool []
-    todo("brotli-nv.brotlienc.supports_custom_dictionary")
+    false
 
 // The window bits this encoder would choose for an input of this size.
 //
@@ -228,11 +964,14 @@ pub fn supports_custom_dictionary() -> Bool []
 // decoder: a 2 KB response compressed with a 16 MiB window makes every
 // reader allocate 16 MiB to read 2 KB.
 pub fn window_bits_for(input_len: Int) -> Int []
-    todo("brotli-nv.brotlienc.window_bits_for")
+    var wb = 10
+    while wb < 24 and brotlistream.window_size_of(wb) < input_len
+        wb = wb + 1
+    wb
 
 // The limits a decoder would need to read what this quality produces.
 //
 // The other half of the courtesy above, as a value a producer can send
 // to a consumer — or a test can compare a round trip against.
 pub fn limits_for(q: BroQuality) -> brotlistream.BroLimits []
-    todo("brotli-nv.brotlienc.limits_for")
+    BroLimits { max_window: brotlistream.window_size_of(q.window_bits), max_output: 0 }
