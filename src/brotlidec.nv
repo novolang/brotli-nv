@@ -1,7 +1,5 @@
 // brotlidec.nv — feed and drain, over a window the caller sized.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE SHAPE IS flate-nv's, AND DELIBERATELY SO.  A caller pushes
 // compressed chunks in and pulls decompressed bytes out; the decoder
 // holds the window and nothing else; and the loop that drives it is
@@ -30,7 +28,13 @@
 // that needs that guarantee brings its own, and `has_checksum` says so
 // as a value rather than leaving the absence to be noticed.
 
+use std.bytes
+use brotlicontext
+use brotlidict
+use brotlidist
 use brotlierror
+use brotliblock
+use brotliprefix
 use brotlistream
 
 // What one step of the decoder did.
@@ -57,66 +61,724 @@ pub enum BroStep
 
 // A decode in progress.
 //
-// Holds the window, the current meta-block's state, and the position
-// in the stream.  Everything a caller needs to know about it is a
-// function below; the fields are not public because their shape is
-// the implementation's to choose and pinning it here would make the
-// first optimisation a breaking change.
+// Holds the window, the unread input, and the state of the current
+// meta-block: its prefix codes, its context maps, where each block-type
+// run stands and the command being carried out.  Everything a caller
+// needs to know about it is a function below; the fields are not public
+// API because their shape is the implementation's to choose and pinning
+// it here would make the first optimisation a breaking change.
+//
+// The type is mutable: `step` and `feed` write into the decoder they
+// are given, which is why they take it as a `var` argument.
 pub struct BroDecoder
-    // The sliding window, sized from the caller's budget and the
-    // stream's header.
-    window: Bytes
-    // How many bytes of the window are live.
-    window_len: Int
+    // The sliding window, as a ring of `window_len` bytes (a power of
+    // two) that also holds the bytes produced and not yet handed over.
+    var window: Bytes
+    // The ring's size in bytes.
+    var window_len: Int
+    // The largest distance a back reference may reach: `(1 << bits) - 16`.
+    var window_size: Int
     // How many bytes the decoder has produced since the start of the
     // stream.  THE NUMBER `brotlidist.resolve` NEEDS: it is what
     // decides a back reference from a dictionary reference.
-    produced: Int
-    // Where the decoder is in the compressed stream, in bits.
-    bit_pos: Int
+    var produced: Int
+    // How many of those the caller has taken.
+    var delivered: Int
+    // The unread input and the cursor over it, and how many bytes of the
+    // stream came before the first byte held.
+    var rd: BroReader
+    var dropped: Int
     // Which internal state the machine is in.  An `Int` rather than an
     // enum because the set is the implementation's business and a
     // public enum would make adding a state a breaking change.
-    state: Int
-    // The last fault, or 0.  Kept so `is_failed` can answer without
-    // the caller having held on to a `Result`.
-    fault_code: Int
+    var state: Int
+    // 1 once the decoder has failed, else 0.
+    var fault_code: Int
+    // The fault itself.
+    var fault: ?BroFault
+    // The budget the caller set.
+    max_window: Int
+    max_output: Int
+    // The current meta-block: bytes still owed, whether it is the last,
+    // and the bytes still to be copied or skipped from the input.
+    var mlen_left: Int
+    var is_last: Bool
+    var skip_left: Int
+    // Per category (literals, insert-and-copy, distances): how many block
+    // types there are, the one in effect, the one before it, and how many
+    // symbols are left in the run.
+    var nbl: [Int]
+    var blk_cur: [Int]
+    var blk_prev: [Int]
+    var blk_rem: [Int]
+    // The prefix codes that read a block-type code and a run length.
+    var type_tabs: [BroTable]
+    var count_tabs: [BroTable]
+    // The context mode of each literal block type, and the context maps.
+    var lit_modes: [Int]
+    var lit_map: [Int]
+    var dist_map: [Int]
+    // The prefix codes of the three alphabets.
+    var lit_trees: [BroTable]
+    var cmd_trees: [BroTable]
+    var dist_trees: [BroTable]
+    // The distance code layout.
+    var npostfix: Int
+    var ndirect: Int
+    // The command in progress: literals left to insert, the copy length,
+    // whether the distance is the implicit one.
+    var insert_left: Int
+    var copy_len: Int
+    var implicit: Bool
+    // The four last distances.
+    var cache0: Int
+    var cache1: Int
+    var cache2: Int
+    var cache3: Int
+    // The copy in progress: how many bytes are left, how far back they
+    // come from (0 for a dictionary word), and the word's bytes.
+    var copy_left: Int
+    var copy_dist: Int
+    var pend: Bytes
+    var pend_pos: Int
+    // The two bytes before the next one, for literal contexts.
+    var p1: Int
+    var p2: Int
+    // The static dictionary, loaded on the first reference to it.
+    var dict: Bytes
+
+// ── Internals ────────────────────────────────────────────────────────
+
+const ST_HEADER = 0
+const ST_META = 1
+const ST_SETUP = 2
+const ST_CMD = 3
+const ST_LITS = 4
+const ST_DIST = 5
+const ST_COPY = 6
+const ST_RAW = 7
+const ST_SKIP = 8
+const ST_DONE = 9
+const ST_FAILED = 10
+
+// The count a category with a single block type reports: it never
+// reaches zero in a meta-block that is at most 16 MiB long.
+const FOREVER = 1073741824
+
+// The decoder with nothing read: the state `decoder` starts from.
+fn blank(limits: BroLimits) -> BroDecoder
+    BroDecoder { window: bytes.zeros(0), window_len: 0, window_size: 0, produced: 0, delivered: 0,
+                 rd: brotlistream.reader(bytes.zeros(0), 0), dropped: 0, state: ST_HEADER, fault_code: 0,
+                 fault: None, max_window: limits.max_window, max_output: limits.max_output,
+                 mlen_left: 0, is_last: false, skip_left: 0, nbl: [1, 1, 1], blk_cur: [0, 0, 0],
+                 blk_prev: [1, 1, 1], blk_rem: [FOREVER, FOREVER, FOREVER],
+                 type_tabs: [] as [BroTable], count_tabs: [] as [BroTable], lit_modes: [0],
+                 lit_map: [] as [Int], dist_map: [] as [Int], lit_trees: [] as [BroTable],
+                 cmd_trees: [] as [BroTable], dist_trees: [] as [BroTable], npostfix: 0, ndirect: 0,
+                 insert_left: 0, copy_len: 0, implicit: false, cache0: 4, cache1: 11, cache2: 15,
+                 cache3: 16, copy_left: 0, copy_dist: 0, pend: bytes.zeros(0), pend_pos: 0, p1: 0,
+                 p2: 0, dict: bytes.zeros(0) }
+
+// The fault with the position it carries moved by `by` bytes, because the
+// parts of the package that find a fault count from the start of the bytes
+// they were given and the decoder has dropped what it already used.
+fn shifted(f: BroFault, by: Int) -> BroFault
+    match f
+        BroBadPrefixCode(at, total) => BroBadPrefixCode(at + by, total)
+        BroBadSimpleCode(at, count) => BroBadSimpleCode(at + by, count)
+        BroBadMetaBlock(at, field)  => BroBadMetaBlock(at + by, field)
+        BroBadContextMap(at, size)  => BroBadContextMap(at + by, size)
+        _                           => f
+
+// Stop the decoder with a fault, counted from the first byte ever fed.
+fn fail(var d: BroDecoder, f: BroFault)
+    let g = shifted(f, d.dropped)
+    d.fault = Some(g)
+    d.fault_code = 1
+    d.state = ST_FAILED
+
+// Put the cursor back where an item began, because the item ran out of
+// input and will be read again when there is more.
+fn rewind(var d: BroDecoder, save: Int)
+    d.rd.pos = save
+    d.rd.over = false
+
+// The byte offset the cursor is at, counted from the first byte held;
+// `fail` adds the bytes already dropped.
+fn at_byte(d: BroDecoder) -> Int
+    d.rd.pos / 8
+
+// ── Writing output ───────────────────────────────────────────────────
+
+// Append one byte to the ring.
+fn put_byte(var d: BroDecoder, b: Int)
+    bytes.set_u8(d.window, d.produced & (d.window_len - 1), b)
+    d.produced = d.produced + 1
+    d.mlen_left = d.mlen_left - 1
+    d.p2 = d.p1
+    d.p1 = b
+
+// Append `n` bytes of `src` from `from` to the ring, which may wrap.
+fn put_slice(var d: BroDecoder, src: Bytes, from: Int, n: Int)
+    let at = d.produced & (d.window_len - 1)
+    let first = if at + n > d.window_len
+        d.window_len - at
+    else
+        n
+    bytes.copy_into(d.window, at, src, from, first)
+    if first < n
+        bytes.copy_into(d.window, 0, src, from + first, n - first)
+    if n >= 2
+        d.p2 = bytes.byte_at(src, from + n - 2) ?? 0
+        d.p1 = bytes.byte_at(src, from + n - 1) ?? 0
+    elif n == 1
+        d.p2 = d.p1
+        d.p1 = bytes.byte_at(src, from) ?? 0
+    d.produced = d.produced + n
+    d.mlen_left = d.mlen_left - n
+
+// ── Reading, with the cursor kept in the decoder ─────────────────────
+
+// A number of up to 8 bits in the format's variable-length spelling:
+// one bit for zero, otherwise three bits of width and the digits.
+fn read_var_len(var d: BroDecoder) -> Int
+    if brotlistream.read_bits(var d.rd, 1) == 0
+        0
+    else
+        let n = brotlistream.read_bits(var d.rd, 3)
+        if n == 0
+            1
+        else
+            (1 << n) + brotlistream.read_bits(var d.rd, n)
+
+// Read `count` prefix codes of `alphabet` symbols as decoding tables.
+// A code that is not valid stops the decoder; a stream that ends inside
+// one leaves `over` set for the caller to rewind.
+fn read_trees(var d: BroDecoder, count: Int, alphabet: Int) -> [BroTable]
+    var out = [] as [BroTable]
+    var i = 0
+    while i < count and d.state != ST_FAILED and not d.rd.over
+        match brotliprefix.read_code(var d.rd, alphabet)
+            Ok(p)  =>
+                out = list.push(out, brotliprefix.table_of(p))
+            Err(e) =>
+                if not d.rd.over
+                    fail(var d, e)
+        i = i + 1
+    out
+
+// A block count read with its prefix code.
+fn read_count(var d: BroDecoder, t: BroTable) -> Int
+    let sym = brotliprefix.decode_with(t, var d.rd)
+    let extra = brotlistream.read_bits(var d.rd, brotliblock.block_count_extra_bits(sym))
+    brotliblock.block_count_of(sym, extra)
+
+// Read a block switch for a category: the new type and the run it lasts.
+// Nothing is written unless the whole switch was read.
+//
+// The type code is read with a prefix code over `nbl + 2` symbols, and
+// the largest names type `nbl - 1`, so no stream can name a type that
+// does not exist and there is no fault to raise here.
+fn read_switch(var d: BroDecoder, cat: Int)
+    let code = brotliprefix.decode_with(d.type_tabs[cat], var d.rd)
+    let run = read_count(var d, d.count_tabs[cat])
+    if not d.rd.over
+        let s = BroBlockState { current: d.blk_cur[cat], previous: d.blk_prev[cat], remaining: 0 }
+        let n = brotliblock.switch_to(s, code, d.nbl[cat], run)
+        d.blk_cur[cat] = n.current
+        d.blk_prev[cat] = n.previous
+        d.blk_rem[cat] = n.remaining
+
+// ── The states ───────────────────────────────────────────────────────
+
+// Whether a fault only says the input ended too soon.
+fn is_truncated(f: BroFault) -> Bool
+    match f
+        BroTruncated(_, _) => true
+        _                  => false
+
+// The stream header: the window size, checked against the budget, and
+// the ring that holds it.
+fn do_header(var d: BroDecoder) -> Bool
+    let limits = BroLimits { max_window: d.max_window, max_output: d.max_output }
+    match brotlistream.parse_header(d.rd.src, limits)
+        Ok(h)  =>
+            brotlistream.skip_bits(var d.rd, h.header_bits)
+            d.window_size = h.window_size
+            d.window_len = 1 << h.window_bits
+            d.window = bytes.zeros(d.window_len)
+            d.state = ST_META
+            true
+        Err(e) =>
+            if not is_truncated(e)
+                fail(var d, e)
+            false
+
+// A meta-block header, and what follows from it.
+fn do_meta(var d: BroDecoder) -> Bool
+    let save = d.rd.pos
+    match brotliblock.read_header_from(var d.rd)
+        Err(e) =>
+            if d.rd.over
+                rewind(var d, save)
+            else
+                fail(var d, e)
+            false
+        Ok(h)  =>
+            meta_kind(var d, h)
+
+// Act on a meta-block header that was read whole.  The padding before a
+// stored or metadata payload lies inside the last byte of input, so
+// skipping it cannot run past the end.
+fn meta_kind(var d: BroDecoder, h: BroBlockHeader) -> Bool
+    let padded = brotliblock.payload_is_aligned(h)
+    let clean = if padded
+        brotlistream.align(var d.rd)
+    else
+        true
+    if not clean
+        fail(var d, BroBadMetaBlock(at_byte(d), "padding"))
+        false
+    else
+        d.is_last = h.is_last
+        match h.kind
+            BroLastEmpty  =>
+                d.state = ST_DONE
+            BroMetadata   =>
+                d.skip_left = h.skip_len
+                d.state = ST_SKIP
+            BroStored     =>
+                d.skip_left = h.length
+                d.mlen_left = h.length
+                d.state = ST_RAW
+            BroCompressed =>
+                d.mlen_left = h.length
+                d.state = ST_SETUP
+        true
+
+// Where a meta-block that finished leaves the decoder.
+fn end_block(var d: BroDecoder)
+    if d.is_last
+        d.state = ST_DONE
+    else
+        d.state = ST_META
+
+// Skip the bytes of a metadata block.
+fn do_skip(var d: BroDecoder) -> Bool
+    let have = bytes.len(d.rd.src) - d.rd.pos / 8
+    let n = if d.skip_left < have
+        d.skip_left
+    else
+        have
+    brotlistream.skip_bits(var d.rd, n * 8)
+    d.skip_left = d.skip_left - n
+    if d.skip_left == 0
+        end_block(var d)
+        true
+    else
+        false
+
+// Copy the bytes of a stored block from the input to the ring.
+fn do_raw(var d: BroDecoder, budget: Int) -> Bool
+    let have = bytes.len(d.rd.src) - d.rd.pos / 8
+    let room = budget - (d.produced - d.delivered)
+    var n = d.skip_left
+    if have < n
+        n = have
+    if room < n
+        n = room
+    if n <= 0
+        false
+    else
+        put_slice(var d, d.rd.src, d.rd.pos / 8, n)
+        brotlistream.skip_bits(var d.rd, n * 8)
+        d.skip_left = d.skip_left - n
+        if d.skip_left == 0
+            end_block(var d)
+        true
+
+// A compressed meta-block's description: block types, context modes and
+// maps, and the prefix codes.  Read whole or not at all.
+fn do_setup(var d: BroDecoder) -> Bool
+    let save = d.rd.pos
+    var nbl = [1, 1, 1]
+    var type_tabs = [] as [BroTable]
+    var count_tabs = [] as [BroTable]
+    var rem = [FOREVER, FOREVER, FOREVER]
+    let none = BroTable { counts: [] as [Int], symbols: [] as [Int], single: 0 }
+    for cat in 0..3
+        let n = read_var_len(var d) + 1
+        nbl[cat] = n
+        if n >= 2 and d.state != ST_FAILED and not d.rd.over
+            let tt = read_trees(var d, 1, n + 2)
+            let ct = read_trees(var d, 1, 26)
+            if list.len(tt) == 1 and list.len(ct) == 1 and not d.rd.over
+                type_tabs = list.push(type_tabs, tt[0])
+                count_tabs = list.push(count_tabs, ct[0])
+                rem[cat] = read_count(var d, ct[0])
+            else
+                type_tabs = list.push(type_tabs, none)
+                count_tabs = list.push(count_tabs, none)
+        else
+            type_tabs = list.push(type_tabs, none)
+            count_tabs = list.push(count_tabs, none)
+    let npostfix = brotlistream.read_bits(var d.rd, 2)
+    let ndirect = brotlistream.read_bits(var d.rd, 4) << npostfix
+    var modes = [] as [Int]
+    for _ in 0..nbl[0]
+        let mode = brotlistream.read_bits(var d.rd, 2)
+        modes = list.push(modes, mode)
+    let ntrees_l = read_var_len(var d) + 1
+    var lit_map = read_map(var d, 64 * nbl[0], ntrees_l)
+    let ntrees_d = read_var_len(var d) + 1
+    var dist_map = read_map(var d, 4 * nbl[2], ntrees_d)
+    var lit_trees = read_trees(var d, ntrees_l, 256)
+    var cmd_trees = read_trees(var d, nbl[1], 704)
+    var dist_trees = read_trees(var d, ntrees_d, 16 + ndirect + (48 << npostfix))
+    if d.rd.over
+        rewind(var d, save)
+        false
+    elif d.state == ST_FAILED
+        false
+    else
+        d.nbl = nbl
+        d.blk_cur = [0, 0, 0]
+        d.blk_prev = [1, 1, 1]
+        d.blk_rem = rem
+        d.type_tabs = type_tabs
+        d.count_tabs = count_tabs
+        d.lit_modes = modes
+        d.lit_map = lit_map
+        d.dist_map = dist_map
+        d.lit_trees = lit_trees
+        d.cmd_trees = cmd_trees
+        d.dist_trees = dist_trees
+        d.npostfix = npostfix
+        d.ndirect = ndirect
+        d.state = ST_CMD
+        true
+
+// A context map for `size` entries over `trees` codes: read when there
+// is more than one code, all zeros otherwise.
+fn read_map(var d: BroDecoder, size: Int, trees: Int) -> [Int]
+    if trees < 2 or d.rd.over or d.state == ST_FAILED
+        list.zeros(size)
+    else
+        let at = at_byte(d)
+        match brotlicontext.read_map_from(var d.rd, size, trees)
+            Ok(m)  => m.tree_of[:]
+            Err(e) =>
+                if not d.rd.over
+                    fail(var d, e)
+                list.zeros(size)
+
+// The next command: an insert-and-copy symbol and its extra bits.  A
+// meta-block's last command always ends it from `do_lits` or `do_copy`,
+// so there is a command to read whenever this state is entered.
+fn do_cmd(var d: BroDecoder) -> Bool
+    let save = d.rd.pos
+    let cur = d.blk_cur[1]
+    let prev = d.blk_prev[1]
+    let rem = d.blk_rem[1]
+    if rem <= 0
+        read_switch(var d, 1)
+    let sym = brotliprefix.decode_with(d.cmd_trees[d.blk_cur[1]], var d.rd)
+    let ie = brotlistream.read_bits(var d.rd, brotliblock.insert_extra_bits(sym))
+    let ce = brotlistream.read_bits(var d.rd, brotliblock.copy_extra_bits(sym))
+    if d.rd.over
+        rewind(var d, save)
+        d.blk_cur[1] = cur
+        d.blk_prev[1] = prev
+        d.blk_rem[1] = rem
+        false
+    else
+        let c = brotliblock.command_of(sym, ie, ce)
+        d.blk_rem[1] = d.blk_rem[1] - 1
+        d.insert_left = c.insert
+        d.copy_len = c.copy
+        d.implicit = c.implicit_distance
+        d.state = ST_LITS
+        true
+
+// Literals of the current command, one at a time.
+fn do_lits(var d: BroDecoder, budget: Int) -> Bool
+    var progressed = false
+    var blocked = false
+    while d.insert_left > 0 and not blocked and d.state == ST_LITS and d.produced - d.delivered < budget
+        let save = d.rd.pos
+        let cur = d.blk_cur[0]
+        let prev = d.blk_prev[0]
+        let rem = d.blk_rem[0]
+        if rem <= 0
+            read_switch(var d, 0)
+        let t = d.blk_cur[0]
+        let mode = d.lit_modes[t]
+        let ctx = brotlicontext.literal_context(mode_of(mode), d.p1, d.p2)
+        let sym = brotliprefix.decode_with(d.lit_trees[d.lit_map[t * 64 + ctx]], var d.rd)
+        if d.rd.over
+            rewind(var d, save)
+            d.blk_cur[0] = cur
+            d.blk_prev[0] = prev
+            d.blk_rem[0] = rem
+            blocked = true
+        elif d.state != ST_FAILED
+            d.blk_rem[0] = d.blk_rem[0] - 1
+            put_byte(var d, sym)
+            d.insert_left = d.insert_left - 1
+            progressed = true
+    if d.state == ST_LITS and d.insert_left == 0
+        if d.mlen_left == 0
+            end_block(var d)
+        else
+            d.state = ST_DIST
+        true
+    else
+        progressed
+
+// The context mode a number names; the stream cannot name an invalid
+// one, since two bits read only 0 to 3.
+fn mode_of(n: Int) -> BroContextMode
+    match brotlicontext.mode_of(n)
+        Ok(m)  => m
+        // cov: skip — a context mode is read in two bits, so it is always 0 to 3
+        Err(_) => BroLsb6
+
+// The distance of the command, and what it names.
+fn do_dist(var d: BroDecoder) -> Bool
+    let save = d.rd.pos
+    let cur = d.blk_cur[2]
+    let prev = d.blk_prev[2]
+    let rem = d.blk_rem[2]
+    var code = 0
+    var extra = 0
+    let params = BroDistParams { npostfix: d.npostfix, ndirect: d.ndirect }
+    if not d.implicit
+        if rem <= 0
+            read_switch(var d, 2)
+        let t = d.blk_cur[2]
+        let ctx = brotlicontext.distance_context(d.copy_len)
+        code = brotliprefix.decode_with(d.dist_trees[d.dist_map[t * 4 + ctx]], var d.rd)
+        extra = brotlistream.read_bits(var d.rd, brotlidist.extra_bits(params, code))
+    if d.rd.over
+        rewind(var d, save)
+        d.blk_cur[2] = cur
+        d.blk_prev[2] = prev
+        d.blk_rem[2] = rem
+        false
+    else
+        if not d.implicit
+            d.blk_rem[2] = d.blk_rem[2] - 1
+        let cache = BroDistCache { d0: d.cache0, d1: d.cache1, d2: d.cache2, d3: d.cache3 }
+        let reach = if d.produced < d.window_size
+            d.produced
+        else
+            d.window_size
+        resolved(var d, brotlidist.resolve(params, cache, code, extra, reach, d.copy_len), cache, code)
+
+// Carry out what a distance resolved to.
+fn resolved(var d: BroDecoder, r: BroReference, cache: BroDistCache, code: Int) -> Bool
+    match r
+        BroBackRef(dist, len)              =>
+            if len > d.mlen_left
+                fail(var d, BroLengthMismatch(d.mlen_left, len))
+                false
+            else
+                let c = brotlidist.push(cache, code, dist)
+                d.cache0 = c.d0
+                d.cache1 = c.d1
+                d.cache2 = c.d2
+                d.cache3 = c.d3
+                d.copy_left = len
+                d.copy_dist = dist
+                d.state = ST_COPY
+                true
+        BroDictWord(len, index, transform) =>
+            if bytes.len(d.dict) == 0
+                d.dict = brotlidict.dictionary_data()
+            match brotlidict.transformed_from(d.dict, len, index, transform)
+                // cov: skip — `resolve` answers a word only for a length of 4 to 24, an index inside its count and a transform below 121, which are the only refusals `transformed_from` has
+                Err(e) =>
+                    fail(var d, e)
+                    false
+                Ok(b)  =>
+                    if bytes.len(b) > d.mlen_left
+                        fail(var d, BroLengthMismatch(d.mlen_left, bytes.len(b)))
+                        false
+                    else
+                        d.pend = bytes.clone(b)
+                        d.pend_pos = 0
+                        d.copy_left = bytes.len(b)
+                        d.copy_dist = 0
+                        d.state = ST_COPY
+                        true
+        BroDistOutOfRange(dd, produced)    =>
+            fail(var d, BroBadDistance(dd, produced))
+            false
+
+// Copy the bytes of a back reference or a dictionary word.
+fn do_copy(var d: BroDecoder, budget: Int) -> Bool
+    let room = budget - (d.produced - d.delivered)
+    let n = if d.copy_left < room
+        d.copy_left
+    else
+        room
+    if d.copy_dist == 0
+        put_slice(var d, d.pend, d.pend_pos, n)
+        d.pend_pos = d.pend_pos + n
+    else
+        let mask = d.window_len - 1
+        for _ in 0..n
+            put_byte(var d, bytes.byte_at(d.window, (d.produced - d.copy_dist) & mask) ?? 0)
+    d.copy_left = d.copy_left - n
+    if d.copy_left == 0
+        if d.mlen_left == 0
+            end_block(var d)
+        else
+            d.state = ST_CMD
+    true
+
+// Run the state the decoder is in.  Answers whether it made progress,
+// which is false when it needs more input.
+fn run_state(var d: BroDecoder, budget: Int) -> Bool
+    let s = d.state
+    let went = if s == ST_HEADER
+        do_header(var d)
+    elif s == ST_META
+        do_meta(var d)
+    elif s == ST_SETUP
+        do_setup(var d)
+    elif s == ST_CMD
+        do_cmd(var d)
+    elif s == ST_LITS
+        do_lits(var d, budget)
+    elif s == ST_DIST
+        do_dist(var d)
+    elif s == ST_COPY
+        do_copy(var d, budget)
+    elif s == ST_RAW
+        do_raw(var d, budget)
+    else
+        do_skip(var d)
+    if d.max_output > 0 and d.produced > d.max_output and d.state != ST_FAILED
+        fail(var d, BroOutputFull(d.produced - d.max_output))
+    went
+
+// Decode until `budget` bytes are waiting to be taken, the stream ends,
+// or the input runs out.
+fn advance(var d: BroDecoder, budget: Int)
+    var go = true
+    while go
+        if d.state == ST_DONE or d.state == ST_FAILED or d.produced - d.delivered >= budget
+            go = false
+        else
+            go = run_state(var d, budget)
+
+// What `drain_all` collected.
+struct Drained
+    chunks: [Bytes]
+    total: Int
+
+// Run a whole stream through a decoder in 64 KiB steps, keeping the
+// output when `keep` is set and only counting it otherwise.
+fn drain_all(src: Bytes, limits: BroLimits, keep: Bool) -> Result<Drained, BroFault>
+    match decoder(src, limits)
+        Err(e) => Err(e)
+        Ok(d0) =>
+            var d = d0
+            var buf = bytes.zeros(65536)
+            var chunks = [] as [Bytes]
+            var total = 0
+            var going = true
+            var starved = false
+            while going
+                match step(var d, var buf, 0)
+                    BroProduced(n) =>
+                        total = total + n
+                        if keep
+                            chunks = list.push(chunks, bytes.slice(buf, 0, n))
+                    BroDone        =>
+                        going = false
+                    _              =>
+                        going = false
+                        starved = true
+            match d.fault
+                Some(f) => Err(f)
+                None    =>
+                    if starved
+                        Err(BroTruncated(bytes.len(src), 1))
+                    else
+                        Ok(Drained { chunks: chunks, total: total })
+
+// ── The public surface ───────────────────────────────────────────────
 
 // Start a decode.
 //
-// The header is parsed here, so a window the caller will not allow is
-// refused before anything is allocated — `BroWindowTooLarge` carrying
-// what the stream asked for and what the budget was.
+// The header is parsed here when `head` holds it, so a window the caller
+// will not allow is refused before anything is allocated —
+// `BroWindowTooLarge` carrying what the stream asked for and what the
+// budget was.  A `head` too short to hold the header is kept, and the
+// header is read once more bytes arrive.
 //
-// ```novo ignore
-// var d = brotlidec.decoder(head, brotlistream.small_limits())!
-// loop
-//     match brotlidec.step(d, chunk, out)
-//         BroProduced(n) => { sink(out, n); d = brotlidec.advanced(d) }
-//         BroNeedMore    => chunk = read_more()
-//         BroWantsDrain  => drain(out)
-//         BroDone        => break
+// ```novo
+// use std.bytes
+// use brotlidec
+// use brotlistream
+//
+// fn main() [io]
+//     match brotlidec.decoder(brotlistream.empty_stream(), brotlistream.small_limits())
+//         Ok(d) => println("${brotlidec.window_bytes(d) > 0}")   // true
+//         Err(_) => println("refused")
 // ```
 pub fn decoder(head: Bytes,
                limits: brotlistream.BroLimits) -> Result<BroDecoder, brotlierror.BroFault> []
-    todo("brotli-nv.brotlidec.decoder")
+    var d = blank(limits)
+    d.rd = brotlistream.reader(bytes.clone(head), 0)
+    run_state(var d, 0)
+    match d.fault
+        Some(f) => Err(f)
+        None    => Ok(d)
 
 // Feed compressed bytes.
 //
-// The decoder does NOT keep the chunk: it consumes what it can and
-// reports how many bytes it took, so the caller's buffer is the
-// caller's and a chunk larger than the decoder wants is not copied.
-pub fn feed(d: BroDecoder, chunk: Bytes) -> Result<BroDecoder, brotlierror.BroFault> []
-    todo("brotli-nv.brotlidec.feed")
+// The decoder keeps the bytes it has not used yet and nothing else: what
+// it consumed is dropped here, so the memory held is the unread input
+// and the window.  Answers the same decoder, advanced; the argument is
+// written to, so a loop can ignore the answer.
+//
+// ```novo
+// use std.bytes
+// use brotlidec
+// use brotlistream
+//
+// fn main() [io]
+//     match brotlidec.decoder(bytes.zeros(0), brotlistream.small_limits())
+//         Ok(d0) =>
+//             var d = d0
+//             match brotlidec.feed(var d, brotlistream.empty_stream())
+//                 Ok(_) => println("${brotlidec.pending_input(d)}")   // 1
+//                 Err(_) => println("refused")
+//         Err(_) => println("refused")
+// ```
+pub fn feed(var d: BroDecoder, chunk: Bytes) -> Result<BroDecoder, brotlierror.BroFault> []
+    match d.fault
+        Some(f) => Err(f)
+        None    =>
+            let used = d.rd.pos / 8
+            let rest = bytes.slice(d.rd.src, used, bytes.len(d.rd.src))
+            d.rd = brotlistream.reader(rest + chunk, d.rd.pos & 7)
+            d.dropped = d.dropped + used
+            if d.state == ST_HEADER
+                run_state(var d, 0)
+            match d.fault
+                Some(f) => Err(f)
+                None    => Ok(d)
 
-// How many bytes of the last chunk the decoder has not consumed.
+// How many bytes of what was fed the decoder has not consumed.
 //
 // Published so a test can assert the decoder is not accumulating, and
-// so a caller re-feeding knows where to resume.  Bounded by the
-// longest single symbol the format can write, which is a constant and
-// not a function of the input.
+// so a caller re-feeding knows where to resume.
 pub fn pending_input(d: BroDecoder) -> Int []
-    todo("brotli-nv.brotlidec.pending_input")
+    bytes.len(d.rd.src) - d.rd.pos / 8
 
 // Run one step, writing into the caller's buffer.
 //
@@ -125,42 +787,79 @@ pub fn pending_input(d: BroDecoder) -> Int []
 // because that is what keeps the decoder's memory a function of the
 // WINDOW rather than of the output, which is the whole reason a
 // four-byte stream cannot ask for a gigabyte of it.
-pub fn step(d: BroDecoder, out: Bytes, at: Int) -> BroStep []
-    todo("brotli-nv.brotlidec.step")
-
-// The decoder after the step that produced bytes.
 //
-// A separate call because `step` answers what HAPPENED and this
-// answers the state AFTER — and a single function returning both would
-// be a tuple every caller destructures at the top of a loop.
-pub fn advanced(d: BroDecoder) -> BroDecoder []
-    todo("brotli-nv.brotlidec.advanced")
+// A decoder that has failed answers `BroDone`; `is_failed` and `fault_of`
+// say why.
+pub fn step(var d: BroDecoder, var out: Bytes, at: Int) -> BroStep []
+    let space = bytes.len(out) - at
+    var pending = d.produced - d.delivered
+    if d.state != ST_FAILED and space > 0 and pending < space
+        let cap = if d.window_len > 64
+            d.window_len - 64
+        else
+            space
+        advance(var d, (if space < cap then space else cap))
+        pending = d.produced - d.delivered
+    let n = if pending < space
+        pending
+    else
+        space
+    if n > 0
+        hand_over(var d, var out, at, n)
+        BroProduced(n)
+    elif d.state == ST_DONE or d.state == ST_FAILED
+        BroDone
+    elif space <= 0
+        BroWantsDrain
+    else
+        BroNeedMore
 
-// Whether the stream is complete.
+// Move `n` finished bytes from the ring to the caller's buffer.
+fn hand_over(var d: BroDecoder, var out: Bytes, at: Int, n: Int)
+    let from = d.delivered & (d.window_len - 1)
+    let first = if from + n > d.window_len
+        d.window_len - from
+    else
+        n
+    bytes.copy_into(out, at, d.window, from, first)
+    if first < n
+        bytes.copy_into(out, at + first, d.window, 0, n - first)
+    d.delivered = d.delivered + n
+
+// The decoder after a step.
+//
+// The decoder `step` is given is written to, so this answers it
+// unchanged.  Kept so a loop that reads "step, then take the advanced
+// decoder" keeps the same shape.
+pub fn advanced(d: BroDecoder) -> BroDecoder []
+    d
+
+// Whether the stream is complete and every byte of it has been taken.
 pub fn is_done(d: BroDecoder) -> Bool []
-    todo("brotli-nv.brotlidec.is_done")
+    d.state == ST_DONE and d.produced == d.delivered
 
 // Whether the decoder has failed and will not make progress.
 pub fn is_failed(d: BroDecoder) -> Bool []
-    todo("brotli-nv.brotlidec.is_failed")
+    d.state == ST_FAILED
 
 // The fault the decoder failed with, or nothing.
 pub fn fault_of(d: BroDecoder) -> ?brotlierror.BroFault []
-    todo("brotli-nv.brotlidec.fault_of")
+    d.fault
 
 // How many bytes the decoder has produced since the start.
 //
 // The number a caller enforcing `max_output` watches, and the same
 // number `brotlidist.resolve` is given.
 pub fn produced(d: BroDecoder) -> Int []
-    todo("brotli-nv.brotlidec.produced")
+    d.produced
 
 // How many bytes the window occupies.
 //
-// The decoder's whole memory cost, published so a caller can assert
-// it against the budget it set.
+// The decoder's whole memory cost besides the unread input, published
+// so a caller can assert it against the budget it set.  0 until the
+// header has been read.
 pub fn window_bytes(d: BroDecoder) -> Int []
-    todo("brotli-nv.brotlidec.window_bytes")
+    d.window_size
 
 // ── For a caller that has the whole thing ────────────────────────────
 
@@ -171,18 +870,42 @@ pub fn window_bytes(d: BroDecoder) -> Int []
 // expands past the bound is refused at the byte it crossed, which is
 // the shape a decompression bomb takes and the reason the unbounded
 // twin does not exist.
+//
+// ```novo
+// use brotlidec
+// use brotlistream
+//
+// fn main() [io]
+//     match brotlidec.decompress(brotlistream.empty_stream(), brotlistream.small_limits())
+//         Ok(b) => println("done")
+//         Err(_) => println("refused")
+// ```
 pub fn decompress(src: Bytes,
                   limits: brotlistream.BroLimits) -> Result<Bytes, brotlierror.BroFault> []
-    todo("brotli-nv.brotlidec.decompress")
+    match drain_all(src, limits, true)
+        Err(e) => Err(e)
+        Ok(r)  => Ok(bytes.concat(r.chunks))
 
 // How many bytes a stream would produce, without producing them.
 //
 // Runs the decode and counts, holding only the window — so a caller
 // deciding whether to accept a response can ask what it would cost
 // before it spends the memory. Bounded by the same `max_output`.
+//
+// ```novo
+// use brotlidec
+// use brotlistream
+//
+// fn main() [io]
+//     match brotlidec.decompressed_size(brotlistream.empty_stream(), brotlistream.small_limits())
+//         Ok(n) => println("${n}")   // 0
+//         Err(_) => println("refused")
+// ```
 pub fn decompressed_size(src: Bytes,
                          limits: brotlistream.BroLimits) -> Result<Int, brotlierror.BroFault> []
-    todo("brotli-nv.brotlidec.decompressed_size")
+    match drain_all(src, limits, false)
+        Err(e) => Err(e)
+        Ok(r)  => Ok(r.total)
 
 // Whether the format carries a checksum: false.
 //
@@ -193,4 +916,4 @@ pub fn decompressed_size(src: Bytes,
 // caller that needs to know the bytes are the ones that went in brings
 // its own.
 pub fn has_checksum() -> Bool []
-    todo("brotli-nv.brotlidec.has_checksum")
+    false
