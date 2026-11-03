@@ -97,6 +97,8 @@ buffer. The encoder's output, 90 streams at five levels, is read by libbrotli.
   stream asked for) from the header on; a four-byte stream can cost the caller
   its budget, which is what the budget is for.
 
+This release requires novo 0.23.0 or later.
+
 ## 0.0.2 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.
